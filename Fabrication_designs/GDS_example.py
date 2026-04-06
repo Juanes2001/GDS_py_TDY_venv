@@ -98,9 +98,9 @@ if __name__ == "__main__":
     gf.gpdk.PDK.activate()
 
     y = adiabatic_y_branch(
-        w0=0.31,
-        w_out=0.31,
-        gap=0.6,
+        w0=0.5,
+        w_out=0.5,
+        gap=0.3,
         L_taper=25.0,
         L_branch=40.0,
     )
