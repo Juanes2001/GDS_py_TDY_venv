@@ -131,18 +131,17 @@ ONA_INPUT_PORT_FMT : str = "input %d"    # produces "input 1", "input 2", …
 #     Edit this list if your actual GUI wiring differs.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Each entry: (ring_name, port_on_ring)
+# Wiring map — documents which physical port feeds each ONA input.
+# Kept for reference; actual connections are made in circuit_builder.py.
 ONA_INPUT_WIRING: list = [
-    ("RING_1", "through"),   # ONA input 1  ← RING_1 through port
-    ("RING_1", "drop"),      # ONA input 2  ← RING_1 drop port  (feeds RING_2 AND ONA? verify)
-    ("RING_2", "drop"),      # ONA input 3  ← RING_2 drop port
-    ("RING_3", "drop"),      # ONA input 4  ← RING_3 drop port
-    ("RING_4", "drop"),      # ONA input 5  ← RING_4 drop port
-    ("RING_5", "drop"),      # ONA input 6  ← RING_5 drop port
-    ("RING_6", "drop"),      # ONA input 7  ← RING_6 drop port
-    ("RING_7", "through"),   # ONA input 8  ← RING_7 through port
-    # NOTE: RING_7 drop is also wired per the description — add a 9th port if needed
-    # ← FILL THIS IN / VERIFY against your actual GUI
+    ("RING_1", "through"),  # ONA input 1  — RING_1 is unique: through → ONA
+    ("RING_2", "drop"),     # ONA input 2
+    ("RING_3", "drop"),     # ONA input 3
+    ("RING_4", "drop"),     # ONA input 4
+    ("RING_5", "drop"),     # ONA input 5
+    ("RING_6", "drop"),     # ONA input 6
+    ("RING_7", "drop"),     # ONA input 7
+    ("RING_7", "through"),  # ONA input 8  — residual after all 7 rings
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,14 +169,23 @@ PLOT_COLORMAP : str   = "plasma"
 PLOT_STYLE    : str   = "seaborn-v0_8-paper"
 
 # Human-readable labels for each ONA input port (used in plot legends)
+# Matches the wiring in circuit_builder.py exactly:
+#   input 1  ←  RING_1 through   (unique: first ring through is monitored)
+#   input 2  ←  RING_2 drop
+#   input 3  ←  RING_3 drop
+#   input 4  ←  RING_4 drop
+#   input 5  ←  RING_5 drop
+#   input 6  ←  RING_6 drop
+#   input 7  ←  RING_7 drop
+#   input 8  ←  RING_7 through   (residual after all 7 rings)
 ONA_PORT_LABELS: list = [
     "RING_1 — through",   # ONA input 1
-    "RING_1 — drop",      # ONA input 2
-    "RING_2 — drop",      # ONA input 3
-    "RING_3 — drop",      # ONA input 4
-    "RING_4 — drop",      # ONA input 5
-    "RING_5 — drop",      # ONA input 6
-    "RING_6 — drop",      # ONA input 7
+    "RING_2 — drop",      # ONA input 2
+    "RING_3 — drop",      # ONA input 3
+    "RING_4 — drop",      # ONA input 4
+    "RING_5 — drop",      # ONA input 5
+    "RING_6 — drop",      # ONA input 6
+    "RING_7 — drop",      # ONA input 7
     "RING_7 — through",   # ONA input 8
 ]
 

@@ -1,28 +1,34 @@
 """
 circuit_builder.py — 7-ring add-drop cascade circuit builder
 =============================================================
-Builds the exact circuit seen in the GUI screenshot:
+Builds the exact circuit seen in the GUI screenshot.
 
-  ONA_1 (1 output, 8 inputs)
-    │
-    output ──────────────────────────► RING_1 input
-                                            │ through ──► ONA input 1
-                                            │ drop    ──► RING_2 input
-                                                              │ drop ──► ONA input 2 (*)
-                                                              │ through ──► RING_3 input
-                                                                                │ ...
-                                                              (chain continues)
-                                                                                │
-                                                                           RING_7
-                                                                              │ through ──► ONA input 7
-                                                                              │ drop    ──► ONA input 8
+  Confirmed wiring topology
+  ──────────────────────────
 
-  (*) Per the user's description: RING_1 drop feeds RING_2 input AND ONA input 2.
-      In INTERCONNECT this is done with a Y-junction or the port is connected to only
-      one element — verify if RING_1 drop goes to ONA input 2 OR only to RING_2.
-      The current implementation connects RING_N drop → RING_(N+1) input,
-      and RING_N drop → ONA input (N+1).  Use a splitter if power needs to be split.
-      ← FILL THIS IN / VERIFY the exact wiring intent.
+  RING_1  (unique behaviour):
+      ONA_1  output  ──► RING_1  input
+      RING_1 through ──► ONA_1   input 1      ← through monitored directly
+      RING_1 drop    ──► RING_2  input         ← drop feeds the cascade
+
+  RING_2 … RING_6  (intermediate rings, standard behaviour):
+      RING_N  drop    ──► ONA_1      input N   ← resonant channel monitored
+      RING_N  through ──► RING_(N+1) input     ← residual light cascades forward
+
+  RING_7  (last ring):
+      RING_7  drop    ──► ONA_1  input 7
+      RING_7  through ──► ONA_1  input 8
+
+  ONA input map:
+      input 1  ←  RING_1 through
+      input 2  ←  RING_2 drop
+      input 3  ←  RING_3 drop
+      input 4  ←  RING_4 drop
+      input 5  ←  RING_5 drop
+      input 6  ←  RING_6 drop
+      input 7  ←  RING_7 drop
+      input 8  ←  RING_7 through
+                                      Total: 8 inputs ✓
 
 Public API:
     build_ring_chain(ic) → dict   builds the full circuit, returns element names
@@ -142,48 +148,40 @@ def build_ring_chain(
     ring_lengths: dict  = None,
 ) -> dict:
     """
-    Build the complete 7-ring add-drop cascade as seen in the GUI.
+    Build the complete 7-ring add-drop cascade.
 
     Wiring logic
     ─────────────
-    ONA_1 output  ──► RING_1 input
+    RING_1 is unique:
+        ONA_1  output  ──► RING_1 input
+        RING_1 through ──► ONA_1  input 1     (through monitored on first ring)
+        RING_1 drop    ──► RING_2 input        (drop feeds the cascade forward)
 
-    For N = 1 … 6:
-        RING_N through  ──► ONA_1 input N          (monitored through port)
-        RING_N drop     ──► RING_(N+1) input        (cascade: drop feeds next ring)
+    RING_2 … RING_6 (intermediate, standard):
+        RING_N  drop    ──► ONA_1      input N
+        RING_N  through ──► RING_(N+1) input
 
-    RING_7 through  ──► ONA_1 input 7
-    RING_7 drop     ──► ONA_1 input 8
+    RING_7 (final ring):
+        RING_7  drop    ──► ONA_1  input 7
+        RING_7  through ──► ONA_1  input 8
 
-    NOTE ON DROP-TO-ONA:
-    The user's description says "drop of RING_N to one input of ONA" AND
-    "drop feeds RING_(N+1)".  In INTERCONNECT a port can only connect to ONE
-    element.  Two options:
-      A) Use a Y-branch splitter between RING_N drop and (ONA + RING_(N+1)).
-      B) The drop port connects ONLY to RING_(N+1); the through port of RING_(N+1)
-         is what goes to ONA — this is the standard demux / spectral slicer topology.
-    This script implements option B (standard cascaded drop-port demux) unless
-    you set WIRE_DROP_TO_ONA_DIRECTLY = True below.
-
-    ← FILL THIS IN: set the flag that matches your actual intended circuit.
+    ONA input count:
+        1  (RING_1 through)
+      + 5  (RING_2 … RING_6 drops)
+      + 1  (RING_7 drop)
+      + 1  (RING_7 through)
+      = 8  ✓
 
     Parameters
     ----------
     ic           : open lumapi.INTERCONNECT session
-    coupling     : override default coupling (None → config.DEFAULT_RING_COUPLING)
-    ring_lengths : override ring lengths dict (None → config.RING_LENGTHS_M)
+    coupling     : coupling coefficient for all rings (None → config default)
+    ring_lengths : ring circumference dict in metres (None → config default)
 
     Returns
     -------
-    dict with keys: "ona", "rings" (list of ring names)
+    dict : {"ona": "ONA_1", "rings": ["RING_1", …, "RING_7"]}
     """
-
-    # ── Configuration ─────────────────────────────────────────────────────
-    # Set to True if RING_N drop connects DIRECTLY to both ONA and RING_(N+1)
-    # (requires a Y-branch; only valid if you added splitters in the GUI).
-    # Set to False for standard cascaded through-port monitoring topology.
-    WIRE_DROP_TO_ONA_DIRECTLY: bool = False   # ← FILL THIS IN
-
     ring_lengths = ring_lengths or config.RING_LENGTHS_M
 
     # ── Add ONA ────────────────────────────────────────────────────────────
@@ -201,57 +199,59 @@ def build_ring_chain(
         )
         ring_names.append(rname)
 
-    # ── Wire ONA output → RING_1 input ────────────────────────────────────
+    # ── ONA output → RING_1 input ──────────────────────────────────────────
     _connect(ic,
-             ona_name,          config.ONA_OUTPUT_PORT,
-             ring_names[0],     config.RING_PORT_INPUT)
+             ona_name,       config.ONA_OUTPUT_PORT,
+             ring_names[0],  config.RING_PORT_INPUT)
+    log.info("  ONA output → RING_1 input")
 
-    # ── Wire the cascade chain ─────────────────────────────────────────────
-    # ONA input port counter starts at 1
-    ona_input_idx = 1
+    # ── RING_1 special case ────────────────────────────────────────────────
+    # Through → ONA input 1  (unique to RING_1)
+    # Drop    → RING_2 input (starts the cascade)
+    _connect(ic,
+             ring_names[0],  config.RING_PORT_THROUGH,
+             ona_name,       config.ONA_INPUT_PORT_FMT % 1)
+    log.info("  RING_1 through → ONA input 1")
 
-    for i, ring_name in enumerate(ring_names):
-        is_last = (i == NUM_RINGS - 1)
-        next_ring = ring_names[i + 1] if not is_last else None
+    _connect(ic,
+             ring_names[0],  config.RING_PORT_DROP,
+             ring_names[1],  config.RING_PORT_INPUT)
+    log.info("  RING_1 drop    → RING_2 input")
 
-        # ── Through port → ONA input N ────────────────────────────────────
+    # ── RING_2 … RING_6 : drop → ONA, through → next ring ─────────────────
+    ona_input_idx = 2   # next available ONA input port
+
+    for i in range(1, NUM_RINGS - 1):   # indices 1..5 → RING_2..RING_6
+        ring_name = ring_names[i]
+        next_ring = ring_names[i + 1]
+
         _connect(ic,
-                 ring_name,   config.RING_PORT_THROUGH,
-                 ona_name,    config.ONA_INPUT_PORT_FMT % ona_input_idx)
-        log.info(f"  {ring_name} through → ONA input {ona_input_idx}")
+                 ring_name,  config.RING_PORT_DROP,
+                 ona_name,   config.ONA_INPUT_PORT_FMT % ona_input_idx)
+        log.info(f"  RING_{i+1} drop    → ONA input {ona_input_idx}")
         ona_input_idx += 1
 
-        if not is_last:
-            if WIRE_DROP_TO_ONA_DIRECTLY:
-                # Option A: drop → ONA input, AND drop → next ring input
-                # This requires a Y-branch splitter element between them.
-                # ← FILL THIS IN: add splitter element and wire it
-                # Example (pseudocode):
-                #   splitter = add_ybranch(ic, name=f"YB_{i+1}")
-                #   _connect(ic, ring_name,  RING_PORT_DROP,   splitter, "input")
-                #   _connect(ic, splitter,   "output 1",       next_ring, RING_PORT_INPUT)
-                #   _connect(ic, splitter,   "output 2",       ona_name,  ONA_INPUT_PORT_FMT % ona_input_idx)
-                #   ona_input_idx += 1
-                log.warning(f"WIRE_DROP_TO_ONA_DIRECTLY=True but Y-branch not implemented. "
-                            f"Connecting drop only to next ring.")
-                _connect(ic,
-                         ring_name,   config.RING_PORT_DROP,
-                         next_ring,   config.RING_PORT_INPUT)
-            else:
-                # Option B (default): drop → next ring input only
-                _connect(ic,
-                         ring_name,   config.RING_PORT_DROP,
-                         next_ring,   config.RING_PORT_INPUT)
-                log.info(f"  {ring_name} drop → {next_ring} input")
-        else:
-            # Last ring: drop → ONA final input
-            _connect(ic,
-                     ring_name,   config.RING_PORT_DROP,
-                     ona_name,    config.ONA_INPUT_PORT_FMT % ona_input_idx)
-            log.info(f"  {ring_name} drop → ONA input {ona_input_idx}")
-            ona_input_idx += 1
+        _connect(ic,
+                 ring_name,  config.RING_PORT_THROUGH,
+                 next_ring,  config.RING_PORT_INPUT)
+        log.info(f"  RING_{i+1} through → RING_{i+2} input")
 
-    log.info(f"Ring chain built: {NUM_RINGS} rings, {ona_input_idx - 1} ONA inputs wired.")
+    # ── RING_7 : both ports → ONA ──────────────────────────────────────────
+    last = ring_names[-1]   # "RING_7"
+
+    _connect(ic,
+             last,      config.RING_PORT_DROP,
+             ona_name,  config.ONA_INPUT_PORT_FMT % ona_input_idx)
+    log.info(f"  RING_7 drop    → ONA input {ona_input_idx}")
+    ona_input_idx += 1
+
+    _connect(ic,
+             last,      config.RING_PORT_THROUGH,
+             ona_name,  config.ONA_INPUT_PORT_FMT % ona_input_idx)
+    log.info(f"  RING_7 through → ONA input {ona_input_idx}")
+    ona_input_idx += 1
+
+    log.info(f"Ring chain complete: {NUM_RINGS} rings — {ona_input_idx - 1} ONA inputs wired.")
     return {"ona": ona_name, "rings": ring_names}
 
 
