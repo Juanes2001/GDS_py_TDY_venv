@@ -29,7 +29,7 @@ from pathlib import Path
 # 1.  LUMERICAL INSTALLATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-LUMERICAL_API_PATH: str = r"C:\Program Files\Lumerical\v242\api\python"  # ← FILL THIS IN
+LUMERICAL_API_PATH: str = r"C:\Program Files\Lumerical\v202\api\python"  # ← FILL THIS IN
 LUMERICAL_VERSION : str = "v242"                                          # ← FILL THIS IN
 HIDE_GUI          : bool = True   # False → show GUI (useful for debugging layout)
 
