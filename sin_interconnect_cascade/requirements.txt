@@ -1,0 +1,11 @@
+# Scientific stack for the SiN PIC simulation packages (LAB 5).
+# Versions are lower bounds known to work; the code is compatible with
+# current NumPy 2.x / Matplotlib 3.x / pandas 2.x–3.x.
+numpy>=1.24
+scipy>=1.10
+h5py>=3.8
+matplotlib>=3.7
+pandas>=2.0
+
+# NOT installable from PyPI — provided by your Ansys Lumerical installation:
+#   lumapi  (ships inside <Lumerical>/api/python; see config.LUMERICAL_VERSION)
