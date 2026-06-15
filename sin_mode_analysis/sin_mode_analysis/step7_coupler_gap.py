@@ -18,6 +18,8 @@ from matplotlib import cm, gridspec, colors
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 import matplotlib.lines as mlines
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
 
 from .config import *  # shared platform constants & paths
 from .lumerical_session import import_lumapi

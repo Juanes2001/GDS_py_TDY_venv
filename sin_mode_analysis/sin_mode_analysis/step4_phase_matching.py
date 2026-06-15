@@ -18,6 +18,7 @@ from matplotlib import cm, gridspec, colors
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 import matplotlib.lines as mlines
+from scipy.interpolate import interp1d
 
 from .config import *  # shared platform constants & paths
 from .plotting import apply_style, save_fig, make_colorbar

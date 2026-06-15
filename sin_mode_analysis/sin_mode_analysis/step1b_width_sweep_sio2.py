@@ -3,7 +3,8 @@ step1b_width_sweep_sio2.py — same FDE width sweep, symmetric SiO2 stack.
 
 Identical engine to step1 but with the upper/lateral cladding index set
 to SiO2 (symmetric stack used by the 13 spectrometer rings). The only
-changes are n_upper_cladding and the output HDF5 path.
+changes are n_upper_cladding and the output HDF5 path. The HDF5 cache
+initialiser and the mode-result extractor are reused from step1.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from datetime import datetime
 
 import numpy as np
 import h5py
+from .step1_width_sweep import _init_hdf5, _extract_mode_results
 
 from .config import *  # shared platform constants & paths
 from .lumerical_session import import_lumapi
