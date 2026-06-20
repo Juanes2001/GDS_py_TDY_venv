@@ -1,11 +1,11 @@
 """
 step5_spectrometer.py — 13 spectrometer rings (radius sweep + phase match).
 
-Extends the sensor-ring analysis to the 13 SiO2-clad spectrometer rings,
-each tuned to one of 13 staggered resonances across the 10 nm FSR.
-Now also captures the radiative bend loss (Im(neff) -> alpha_bend) per
-ring at its own wavelength, mirroring the sensor-ring step. The target
-FSR and waveguide width are inherited from step3 (sibling import).
+Extends the sensor-ring analysis to the SiO2-clad spectrometer rings,
+each tuned to one of the staggered resonances across one FSR. Also
+captures the radiative bend loss (Im(neff) -> alpha_bend) per ring at
+its own wavelength. All spectral inputs (wavelengths, FSR, FWHM) come
+from config; the single-mode width is selected by step2 via state.
 """
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 import matplotlib.lines as mlines
 from scipy.interpolate import interp1d
-from .step3_ring_radius import RR_WG_WIDTH_NM, RR_FSR_NM
 
 from .config import *  # shared platform constants & paths
 from .lumerical_session import import_lumapi
@@ -32,6 +31,7 @@ from . import plotting as _plot
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 _exc = None
 neff_real_sio2 = None
+selected_width_nm = None
 te_frac_sio2 = None
 
 apply_style()
@@ -39,10 +39,41 @@ apply_style()
 # ─────────────────────────────────────────────────────────
 #  Module constants / design knobs for this step
 # ─────────────────────────────────────────────────────────
-N_SPEC_RINGS        = 13
-SPEC_LAM0_NM        = 1550.0
-SPEC_DELTA_LAM_NM   = 10.0 / 13.0          # ≈ 0.769231 nm  (exact rational step)
-SPEC_LAM_NM         = SPEC_LAM0_NM + np.arange(N_SPEC_RINGS) * SPEC_DELTA_LAM_NM
+N_SPEC_RINGS        = N_SPEC_RINGS              # number of spectrometer rings (config)
+SPEC_LAM0_NM        = LAMBDA0_NM                # base wavelength             (config)
+SPEC_DELTA_LAM_NM   = SPEC_DELTA_LAMBDA_NM      # = TARGET_FSR_NM / N_SPEC_RINGS (config)
+SPEC_LAM_NM         = RING_RESONANCES_NM        # the N resonance wavelengths (config)
+SPEC_WG_WIDTH_NM    = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
+                       else float(WG_WIDTH_FALLBACK_NM))   # resolved in run()
+SPEC_FSR_NM         = TARGET_FSR_NM             # target FSR                  (config)
+SPEC_N_UPPER        = N_UPPER_CLADDING_SIO2     # 1.4469   — SiO₂ symmetric   (config)
+SPEC_FWHM_NM        = SPEC_FWHM_NM              # design FWHM per ring        (config)
+SPEC_N_RADII        = 100
+SPEC_R_HALF_SPAN_UM = 19    # [µm]  search half-width around analytical estimate
+SPEC_R_MIN_FLOOR_UM = 20    # [µm]  absolute lower bound (bend loss guard)
+SPEC_DELTA_LAM_NG_NM = 5.0   # [nm]
+SPEC_USE_PML_FOR_LOSS = True    # PML boundaries for the loss solve (False = loss-blind)
+SPEC_Y_SPAN_LOSS_UM   = 16.0    # [µm]  widened lateral span so the PML is past the caustic
+SPEC_MESH_DY_NM       = 50.0    # [nm]  target y cell size over the widened span
+SPEC_PML_LAYERS       = 16      # PML layers (raise if alpha_bend is not converged)
+SPEC_LOSS_TRIAL_MODES = 12      # trial modes for the (leaky) loss solve — more = safer
+SPEC_ALPHA_PROP_DBCM  = 1.0     # [dB/cm] assumed propagation loss, for the total-Q summary
+_PM_TOL_M    = 1e-13    # |ΔR| < 0.1 pm
+_PM_MAX_ITER = 20
+_sp_core_t_um    = CORE_THICKNESS_UM
+_sp_half_t_um    = _sp_core_t_um / 2.0
+_sp_z_below_um   = SIM_Z_BELOW_UM
+_sp_z_above_um   = SIM_Z_ABOVE_UM
+_sp_z_span_um    = _sp_z_below_um + _sp_core_t_um + _sp_z_above_um
+_sp_y_span_um    = SIM_Y_SPAN_UM
+_sp_sio2_z_ctr   = -(_sp_half_t_um + _sp_z_below_um / 2.0)  # below core centre
+_sp_sio2_z_span  = _sp_z_below_um
+_sp_z_ctr        = (_sp_z_above_um - _sp_z_below_um) / 2.0
+_sp_wg_w_m       = SPEC_WG_WIDTH_NM * 1e-9
+_sp_y_span_loss_um = SPEC_Y_SPAN_LOSS_UM if SPEC_USE_PML_FOR_LOSS else _sp_y_span_um
+_sp_mesh_y_loss    = (int(round(_sp_y_span_loss_um * 1e3 / SPEC_MESH_DY_NM))
+                      if SPEC_USE_PML_FOR_LOSS else MESH_CELLS_Y)
+_SP_DBCM_PER_INVM = (10.0 / np.log(10)) / 100.0          # 1/m -> dB/cm
 
 def _sp_per_m_to_dbcm(a_per_m):  return a_per_m * _SP_DBCM_PER_INVM
 
@@ -428,36 +459,17 @@ def run(state=None):
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
-    SPEC_WG_WIDTH_NM    = RR_WG_WIDTH_NM        # 1000 nm  — inherited
-    SPEC_FSR_NM         = RR_FSR_NM             # 10.0 nm  — inherited
-    SPEC_N_UPPER        = N_UPPER_CLADDING_SIO2 # 1.4469   — SiO₂ symmetric
-    SPEC_FWHM_NM        = 0.5                   # [nm]  design FWHM (for the Q_loaded summary)
-    SPEC_N_RADII        = 100
-    SPEC_R_HALF_SPAN_UM = 19    # [µm]  search half-width around analytical estimate
-    SPEC_R_MIN_FLOOR_UM = 20    # [µm]  absolute lower bound (bend loss guard)
-    SPEC_DELTA_LAM_NG_NM = 5.0   # [nm]
-    SPEC_USE_PML_FOR_LOSS = True    # PML boundaries for the loss solve (False = loss-blind)
-    SPEC_Y_SPAN_LOSS_UM   = 16.0    # [µm]  widened lateral span so the PML is past the caustic
-    SPEC_MESH_DY_NM       = 50.0    # [nm]  target y cell size over the widened span
-    SPEC_PML_LAYERS       = 16      # PML layers (raise if alpha_bend is not converged)
-    SPEC_LOSS_TRIAL_MODES = 12      # trial modes for the (leaky) loss solve — more = safer
-    SPEC_ALPHA_PROP_DBCM  = 1.0     # [dB/cm] assumed propagation loss, for the total-Q summary
-    _PM_TOL_M    = 1e-13    # |ΔR| < 0.1 pm
-    _PM_MAX_ITER = 20
-    _sp_core_t_um    = CORE_THICKNESS_UM
-    _sp_half_t_um    = _sp_core_t_um / 2.0
-    _sp_z_below_um   = SIM_Z_BELOW_UM
-    _sp_z_above_um   = SIM_Z_ABOVE_UM
-    _sp_z_span_um    = _sp_z_below_um + _sp_core_t_um + _sp_z_above_um
-    _sp_y_span_um    = SIM_Y_SPAN_UM
-    _sp_sio2_z_ctr   = -(_sp_half_t_um + _sp_z_below_um / 2.0)  # below core centre
-    _sp_sio2_z_span  = _sp_z_below_um
-    _sp_z_ctr        = (_sp_z_above_um - _sp_z_below_um) / 2.0
-    _sp_wg_w_m       = SPEC_WG_WIDTH_NM * 1e-9
-    _sp_y_span_loss_um = SPEC_Y_SPAN_LOSS_UM if SPEC_USE_PML_FOR_LOSS else _sp_y_span_um
-    _sp_mesh_y_loss    = (int(round(_sp_y_span_loss_um * 1e3 / SPEC_MESH_DY_NM))
-                          if SPEC_USE_PML_FOR_LOSS else MESH_CELLS_Y)
-    _SP_DBCM_PER_INVM = (10.0 / np.log(10)) / 100.0          # 1/m -> dB/cm
+    if WG_WIDTH_OVERRIDE_NM is not None:
+        SPEC_WG_WIDTH_NM = float(WG_WIDTH_OVERRIDE_NM)
+    elif selected_width_nm is not None:
+        SPEC_WG_WIDTH_NM = float(selected_width_nm)
+    else:
+        SPEC_WG_WIDTH_NM = float(WG_WIDTH_FALLBACK_NM)
+        log.warning("step5: no single-mode width from the modal step and no "
+                    f"WG_WIDTH_OVERRIDE_NM; using fallback {SPEC_WG_WIDTH_NM:.0f} nm.")
+    _sp_wg_w_m = SPEC_WG_WIDTH_NM * 1e-9
+    log.info(f"step5 single-mode working width = {SPEC_WG_WIDTH_NM:.1f} nm "
+             f"(override={WG_WIDTH_OVERRIDE_NM}, selected={selected_width_nm})")
     print("=" * 70)
     print("  SPECTROMETER RING ARRAY — SiO₂/SiN/SiO₂  (symmetric cladding)")
     print("=" * 70)

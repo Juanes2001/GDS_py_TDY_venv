@@ -27,7 +27,6 @@ from . import plotting as _plot
 FWHM_SENSOR_NM = None
 FWHM_SPEC_NM = None
 L_pm_um = None
-N_SPEC_RINGS = None
 RR_LAM0_NM = None
 RR_WG_WIDTH_NM = None
 R_pm_um = None

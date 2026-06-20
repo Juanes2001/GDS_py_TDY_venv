@@ -27,6 +27,7 @@ from . import plotting as _plot
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 neff_real = None
 neff_real_sio2 = None
+select_single_mode_width_nm = None
 sweep_widths_um = None
 sweep_wl_nm = None
 te_frac = None
@@ -369,7 +370,7 @@ def run(state=None):
     between steps (the notebook's old kernel globals + bridge).
     Returns the updated `state`."""
     state = {} if state is None else state
-    global FIG_SIZE_2X2, FONT_ANNOT, FONT_AXLABEL, FONT_CBAR, FONT_LEGEND, FONT_SUPTITLE, FONT_TICK, FONT_TITLE, GRID_ALPHA, LEGEND_ALPHA, LINESTYLES, MAX_POL_MODES, PLASMA_RANGE, SAVE_DPI, TE_THRESHOLD, c_TE, c_TM, env_str, fig_aq, fig_sio2, n_uc, pd, pol_aq, pol_sio2
+    global FIG_SIZE_2X2, FONT_ANNOT, FONT_AXLABEL, FONT_CBAR, FONT_LEGEND, FONT_SUPTITLE, FONT_TICK, FONT_TITLE, GRID_ALPHA, LEGEND_ALPHA, LINESTYLES, MAX_POL_MODES, PLASMA_RANGE, SAVE_DPI, TE_THRESHOLD, _te_cutoffs, c_TE, c_TM, env_str, fig_aq, fig_sio2, mm_cutoff_te_nm, n_uc, pd, pol_aq, pol_sio2, selected_width_nm
     globals().update(state)
 
     pol_aq   = extract_pol_data(neff_real,      te_frac,      N_SIO2_FIXED)
@@ -381,18 +382,35 @@ def run(state=None):
     print(f"  λ     : {sweep_wl_nm[0]:.4f} → {sweep_wl_nm[-1]:.4f} nm  "
           f"({len(sweep_wl_nm)} pts,  Δλ = 10/13 nm)")
     print("=" * 66)
+    _te_cutoffs = []   # collect the TE multimode-onset width for each cladding env
     for env_str, pd, n_uc in [
         (f"Aqueous  (n_upper = {N_UPPER_CLADDING})",    pol_aq,   N_UPPER_CLADDING),
         (f"Silica   (n_upper = {N_UPPER_CLADDING_SIO2:.4f})", pol_sio2, N_UPPER_CLADDING_SIO2),
     ]:
         c_TE = find_mm_cutoff_nm(pd["n_TE"], sweep_widths_um)
         c_TM = find_mm_cutoff_nm(pd["n_TM"], sweep_widths_um)
+        if c_TE is not None:
+            _te_cutoffs.append(c_TE)
 
         print(f"\n  {env_str}")
         print(f"    TE  max modes = {int(pd['n_TE'].max())}  │  "
               + (f"MM cutoff ≈ {c_TE:.0f} nm" if c_TE else "single-mode across full sweep"))
         print(f"    TM  max modes = {int(pd['n_TM'].max())}  │  "
               + (f"MM cutoff ≈ {c_TM:.0f} nm" if c_TM else "single-mode across full sweep"))
+    mm_cutoff_te_nm   = min(_te_cutoffs) if _te_cutoffs else None
+    selected_width_nm = select_single_mode_width_nm(mm_cutoff_te_nm)
+    print("\n" + "=" * 66)
+    if WG_WIDTH_OVERRIDE_NM is not None:
+        print(f"  SINGLE-MODE WORKING WIDTH  : {selected_width_nm:.1f} nm  "
+              f"(forced via WG_WIDTH_OVERRIDE_NM)")
+    elif selected_width_nm is not None:
+        print(f"  SINGLE-MODE WORKING WIDTH  : {selected_width_nm:.1f} nm")
+        print(f"    = min TE cutoff {mm_cutoff_te_nm:.1f} nm − margin "
+              f"{SINGLE_MODE_MARGIN_NM:.0f} nm")
+    else:
+        print("  SINGLE-MODE WORKING WIDTH  : NOT determined — the guide is single-")
+        print("    mode across the whole sweep and no WG_WIDTH_OVERRIDE_NM was set.")
+    print("=" * 66)
     print("\n" + "─" * 62)
     print("  Plotting: Aqueous cladding")
     print("─" * 62)
@@ -425,8 +443,9 @@ def run(state=None):
     state.update({k: globals().get(k) for k in [
         'FIG_SIZE_2X2', 'FONT_ANNOT', 'FONT_AXLABEL', 'FONT_CBAR', 'FONT_LEGEND', 'FONT_SUPTITLE',
         'FONT_TICK', 'FONT_TITLE', 'GRID_ALPHA', 'LEGEND_ALPHA', 'LINESTYLES', 'MAX_POL_MODES',
-        'PLASMA_RANGE', 'SAVE_DPI', 'TE_THRESHOLD', 'c_TE', 'c_TM', 'env_str',
-        'fig_aq', 'fig_sio2', 'n_uc', 'pd', 'pol_aq', 'pol_sio2',
+        'PLASMA_RANGE', 'SAVE_DPI', 'TE_THRESHOLD', '_te_cutoffs', 'c_TE', 'c_TM',
+        'env_str', 'fig_aq', 'fig_sio2', 'mm_cutoff_te_nm', 'n_uc', 'pd',
+        'pol_aq', 'pol_sio2', 'selected_width_nm',
     ] if k in globals()})
     return state
 

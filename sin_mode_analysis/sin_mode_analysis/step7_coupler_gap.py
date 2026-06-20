@@ -43,6 +43,7 @@ cc_lam_res_nm = None
 i = None
 j = None
 n = None
+selected_width_nm = None
 
 apply_style()
 
@@ -56,7 +57,8 @@ DC_GAP_MAX_NM  = 450.0      # [nm]  maximum gap — evanescent overlap negligibl
 DC_N_GAPS      = 100        # number of sweep points per coupler
 DC_LC_SELECTOR = "a"
 DC_N_MODES     = max(N_MODES_REQUEST, 6)
-_DC_WG_W_NM    = 1000.0     # [nm]  waveguide width (confirmed from notebook)
+_DC_WG_W_NM    = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
+                  else float(WG_WIDTH_FALLBACK_NM))   # provisional; resolved in run()
 _DC_WG_W_UM    = _DC_WG_W_NM * 1e-3        # 1.000 µm
 _DC_WG_W_M     = _DC_WG_W_NM * 1e-9        # metres
 _DC_MARGIN_UM  = 2.0        # [µm]  cladding margin each side beyond outer waveguide
@@ -340,6 +342,19 @@ def run(state=None):
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
+    if WG_WIDTH_OVERRIDE_NM is not None:
+        _DC_WG_W_NM = float(WG_WIDTH_OVERRIDE_NM)
+    elif selected_width_nm is not None:
+        _DC_WG_W_NM = float(selected_width_nm)
+    else:
+        _DC_WG_W_NM = float(WG_WIDTH_FALLBACK_NM)
+        log.warning("step7: no single-mode width from the modal step and no "
+                    f"WG_WIDTH_OVERRIDE_NM; using fallback {_DC_WG_W_NM:.0f} nm.")
+    _DC_WG_W_UM  = _DC_WG_W_NM * 1e-3
+    _DC_WG_W_M   = _DC_WG_W_NM * 1e-9
+    DC_Y_SPAN_UM = 2.0 * _DC_MARGIN_UM + 2.0 * _DC_WG_W_UM + DC_GAP_MAX_NM * 1e-3
+    log.info(f"step7 single-mode working width = {_DC_WG_W_NM:.1f} nm "
+             f"(override={WG_WIDTH_OVERRIDE_NM}, selected={selected_width_nm})")
     print("=" * 70)
     print("  DIRECTIONAL COUPLER GAP SWEEP — All 14 rings, input + output")
     print("=" * 70)

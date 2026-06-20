@@ -29,6 +29,7 @@ from . import plotting as _plot
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 _exc = None
 _l = None
+selected_width_nm = None
 
 apply_style()
 
@@ -39,9 +40,10 @@ AIS_BEND_RADIUS_UM   = 19.0021        # [µm]  ← change this per experiment
 AIS_N_AQ_START       = 1.3300      # lower bound  (pure water @ 1550 nm)
 AIS_N_AQ_END         = 1.3700      # upper bound  (moderately contaminated water)
 AIS_N_POINTS         = 200         # number of sweep points
-AIS_LAM0_NM          = 1550.0      # [nm]  centre wavelength
+AIS_LAM0_NM          = LAMBDA0_NM  # [nm]  centre wavelength            (config)
 AIS_DELTA_LAM_NM     = 5.0         # [nm]  half-span for central-difference ng
-AIS_WG_WIDTH_NM      = 1000.0      # [nm]  core width  — WIDE face, along Y
+AIS_WG_WIDTH_NM      = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
+                        else float(WG_WIDTH_FALLBACK_NM))   # provisional; resolved in run()
 AIS_WG_HEIGHT_NM     = 400.0       # [nm]  core height — THICKNESS, along Z
 AIS_HIDE_GUI         = False       # True for headless / HPC runs
 AIS_CSV_NAME         = f"AIS_R{AIS_BEND_RADIUS_UM:.2f}um_naq_sweep_{AIS_N_POINTS}pts"
@@ -289,6 +291,28 @@ def run(state=None):
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
+    if WG_WIDTH_OVERRIDE_NM is not None:
+        AIS_WG_WIDTH_NM = float(WG_WIDTH_OVERRIDE_NM)
+    elif selected_width_nm is not None:
+        AIS_WG_WIDTH_NM = float(selected_width_nm)
+    else:
+        AIS_WG_WIDTH_NM = float(WG_WIDTH_FALLBACK_NM)
+        log.warning("step9: no single-mode width from the modal step and no "
+                    f"WG_WIDTH_OVERRIDE_NM; using fallback {AIS_WG_WIDTH_NM:.0f} nm.")
+    _ais_wg_w_m    = AIS_WG_WIDTH_NM * 1e-9
+    _ais_y_span_um = AIS_WG_WIDTH_NM * 1e-3 + 2.0 * _ais_y_margin_um
+    _ais_mesh_y    = int(np.ceil(_ais_y_span_um / _ais_mesh_step_um))
+    _AIS_GROUP_KEY = (
+        f"ais_R{AIS_BEND_RADIUS_UM:.4f}um"
+        f"_w{AIS_WG_WIDTH_NM:.0f}nm"
+        f"_h{AIS_WG_HEIGHT_NM:.0f}nm"
+        f"_{_ais_N}pts"
+        f"_naq{AIS_N_AQ_START:.4f}-{AIS_N_AQ_END:.4f}"
+        f"_lam{AIS_LAM0_NM:.0f}nm"
+    )
+    _AIS_HDF5_GROUP = f"aqueous_index_sweep/{_AIS_GROUP_KEY}"
+    log.info(f"step9 single-mode working width = {AIS_WG_WIDTH_NM:.1f} nm "
+             f"(override={WG_WIDTH_OVERRIDE_NM}, selected={selected_width_nm})")
     print("=" * 68)
     print("  Sensor Ring — Aqueous Index Sweep (Toxic Agent Sensing)")
     print("=" * 68)

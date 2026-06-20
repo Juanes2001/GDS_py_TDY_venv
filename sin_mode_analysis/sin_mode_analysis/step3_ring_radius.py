@@ -27,17 +27,19 @@ from . import plotting as _plot
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 _exc = None
 save_fig = None
+selected_width_nm = None
 
 apply_style()
 
 # ─────────────────────────────────────────────────────────
 #  Module constants / design knobs for this step
 # ─────────────────────────────────────────────────────────
-FWHM_SENSOR_NM      = 0.5        # [nm]  sensor ring target FWHM
-FWHM_SPEC_NM        = 0.5        # [nm]  spectrometer rings default FWHM
-RR_FSR_NM      = 10.0      # [nm]  target free spectral range
-RR_LAM0_NM     = 1550.0    # [nm]  resonance wavelength
-RR_WG_WIDTH_NM = 1000.0    # [nm]  waveguide width  (height = CORE_THICKNESS_UM)
+FWHM_SENSOR_NM = SENSOR_FWHM_NM   # [nm]  sensor ring target FWHM      (config)
+FWHM_SPEC_NM   = SPEC_FWHM_NM     # [nm]  spectrometer rings FWHM       (config)
+RR_FSR_NM      = TARGET_FSR_NM    # [nm]  target free spectral range    (config)
+RR_LAM0_NM     = LAMBDA0_NM       # [nm]  resonance wavelength          (config)
+RR_WG_WIDTH_NM = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
+                  else float(WG_WIDTH_FALLBACK_NM))   # provisional; resolved in run()
 RR_R_MIN_UM  = 18.0    # [µm]
 RR_R_MAX_UM  = 20.0   # [µm]
 RR_N_RADII   = 100
@@ -326,6 +328,23 @@ def run(state=None):
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
+    if WG_WIDTH_OVERRIDE_NM is not None:
+        RR_WG_WIDTH_NM = float(WG_WIDTH_OVERRIDE_NM)
+    elif selected_width_nm is not None:
+        RR_WG_WIDTH_NM = float(selected_width_nm)
+    else:
+        RR_WG_WIDTH_NM = float(WG_WIDTH_FALLBACK_NM)
+        log.warning("step3: no single-mode width from the modal step and no "
+                    f"WG_WIDTH_OVERRIDE_NM; using fallback {RR_WG_WIDTH_NM:.0f} nm.")
+    _wg_w_m       = RR_WG_WIDTH_NM * 1e-9
+    _RR_GROUP_KEY = (
+        f"rr_{RR_FSR_NM:.0f}nm_{RR_LAM0_NM:.0f}nm_"
+        f"{RR_WG_WIDTH_NM:.0f}nm_"
+        f"{RR_R_MIN_UM:.1f}-{RR_R_MAX_UM:.1f}um_{RR_N_RADII}pts"
+    )
+    _RR_HDF5_GROUP = f"ring_radius_sweep/{_RR_GROUP_KEY}"
+    log.info(f"step3 single-mode working width = {RR_WG_WIDTH_NM:.1f} nm "
+             f"(override={WG_WIDTH_OVERRIDE_NM}, selected={selected_width_nm})")
     print("=" * 65)
     print("  Ring Resonator — Radius Sweep for FSR Matching + Bend Loss")
     print("=" * 65)

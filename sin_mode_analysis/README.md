@@ -10,7 +10,7 @@ circuit package (`sin_interconnect_cascade`) needs.
 
 | Quantity | Value |
 |---|---|
-| Core | Si₃N₄ strip, n ≈ 1.99, height 400 nm, width ≈ 1000 nm |
+| Core | Si₃N₄ strip, n ≈ 1.99, height 400 nm, width **auto-selected single-mode** (TE cutoff − `SINGLE_MODE_MARGIN_NM`, default 300 nm) |
 | Lower cladding | SiO₂ (n ≈ 1.4469) |
 | Upper cladding | aqueous analyte (n ≈ 1.33) for the **sensor** ring; SiO₂ for the 13 **spectrometer** rings |
 | Polarization | TE₀ |
@@ -25,7 +25,7 @@ sin_mode_analysis/
 ├── requirements.txt
 ├── README.md
 └── sin_mode_analysis/            # the importable package
-    ├── config.py                 # platform constants, paths, logger
+    ├── config.py                 # SINGLE control panel: all user inputs + width-selection rule
     ├── lumerical_session.py      # robust lumapi import + open_mode()
     ├── storage.py                # HDF5 cache / resume helpers
     ├── plotting.py               # publication style + save_fig (PNG + PDF)
@@ -44,6 +44,36 @@ sin_mode_analysis/
     ├── step10_aqueous_table.py
     └── step11_through_varfdtd.py
 ```
+
+## Configuration (everything you set lives in `config.py`)
+
+`config.py` is the single user-facing control panel. The top **USER INPUTS**
+block holds every quantity that can be fixed without a prior simulation:
+
+| Input | Meaning |
+|---|---|
+| `LAMBDA0_NM` | central / design wavelength (sensor ring) |
+| `TARGET_FSR_NM` | target free spectral range, every ring |
+| `N_SPEC_RINGS` | number of SiO₂ spectrometer rings |
+| `SENSOR_FWHM_NM`, `SPEC_FWHM_NM` | target FWHM of the sensor / spectrometer rings |
+| `RING_RESONANCES_NM` | derived as `LAMBDA0_NM + n·(TARGET_FSR_NM/N_SPEC_RINGS)` |
+| `SINGLE_MODE_MARGIN_NM` | backoff below the TE multimode cutoff (default **300 nm**) |
+| `WG_WIDTH_OVERRIDE_NM` | `None` = auto-select width; a number forces a width |
+| `WG_WIDTH_FALLBACK_NM` | width used only if a step runs without the modal step |
+
+**Single-mode width is the one geometric quantity that cannot be fixed up
+front** (it depends on where the guide goes multimode). Instead of hard-coding
+it, `config.py` defines the *rule*: `step2_modal_plots` measures the TE
+multimode-cutoff width from the width sweep and sets
+
+```
+working width = (TE cutoff width) − SINGLE_MODE_MARGIN_NM
+```
+
+publishing it through `state` as `selected_width_nm`. The four geometry-building
+steps (`step3`, `step5`, `step7`, `step9`) consume that width; the display/
+analytic steps (`step4`, `step6`, `step8`, `step10`, `step11`) receive every
+parameter through `state` and never hold their own copy.
 
 ## Design of the refactor
 
