@@ -89,7 +89,7 @@ SWEEP_WIDTHS_UM = np.linspace(0.600, 1.500, 100)     # [um]
 # Wavelength sweep : lambda0 = 1550 nm + n * (10/13) nm, 13 points
 # (exact rational step so the 13 spectrometer resonances tile one 10 nm FSR)
 # ─────────────────────────────────────────────────────────────────────────────
-LAMBDA_START_NM = 1550.0
+LAMBDA_START_NM = 780
 DELTA_LAMBDA_NM = 10.0 / 13.0                         # ~0.769231 nm
 N_WAVELENGTHS = 13
 SWEEP_WL_NM = LAMBDA_START_NM + np.arange(N_WAVELENGTHS) * DELTA_LAMBDA_NM
