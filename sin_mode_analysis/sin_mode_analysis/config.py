@@ -39,7 +39,7 @@ import numpy as np
 # ╚═════════════════════════════════════════════════════════════════════════════
 
 # ── Operating / design wavelength ────────────────────────────────────────────
-LAMBDA0_NM = 1550.0              # central design wavelength (sensor ring)   [nm]
+LAMBDA0_NM = 780.0              # central design wavelength (sensor ring)   [nm]
 
 # ── Spectral design of the ring cascade ──────────────────────────────────────
 TARGET_FSR_NM  = 10.0            # target free spectral range, every ring    [nm]
