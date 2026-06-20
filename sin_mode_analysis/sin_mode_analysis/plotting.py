@@ -16,7 +16,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib as mpl
+# ─────────────────────────────────────────────────────────────────────────────
+#  Non-interactive backend: figures are SAVED to disk, never displayed.
+#  This is deliberate — an interactive backend's plt.show() blocks the script
+#  until the window is closed, which stalls a long FDE pipeline. With "Agg" no
+#  window is ever opened and plt.show() does nothing, so the run never blocks.
+#  Every step still writes its figures (PNG/PDF) to FIGURES_DIR / DATA_DIR;
+#  open that folder to view them.
+# ─────────────────────────────────────────────────────────────────────────────
+mpl.use("Agg")
 import matplotlib.pyplot as plt
+# Make any stray plt.show() a silent no-op (suppresses the Agg "cannot show"
+# warning and guarantees no blocking, anywhere in the package).
+plt.show = lambda *args, **kwargs: None
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 

@@ -3,6 +3,9 @@ step5_spectrometer.py — 13 spectrometer rings (radius sweep + phase match).
 
 Extends the sensor-ring analysis to the 13 SiO2-clad spectrometer rings,
 each tuned to one of 13 staggered resonances across the 10 nm FSR.
+Now also captures the radiative bend loss (Im(neff) -> alpha_bend) per
+ring at its own wavelength, mirroring the sensor-ring step. The target
+FSR and waveguide width are inherited from step3 (sibling import).
 """
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 import matplotlib.lines as mlines
 from scipy.interpolate import interp1d
+from .step3_ring_radius import RR_WG_WIDTH_NM, RR_FSR_NM
 
 from .config import *  # shared platform constants & paths
 from .lumerical_session import import_lumapi
@@ -26,8 +30,6 @@ from .plotting import apply_style, save_fig, make_colorbar
 from . import plotting as _plot
 
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
-RR_FSR_NM = None
-RR_WG_WIDTH_NM = None
 _exc = None
 neff_real_sio2 = None
 te_frac_sio2 = None
@@ -42,7 +44,30 @@ SPEC_LAM0_NM        = 1550.0
 SPEC_DELTA_LAM_NM   = 10.0 / 13.0          # ≈ 0.769231 nm  (exact rational step)
 SPEC_LAM_NM         = SPEC_LAM0_NM + np.arange(N_SPEC_RINGS) * SPEC_DELTA_LAM_NM
 
-def _sp_build_fde(mode, radius_m: float, wavelength_m: float) -> None:
+def _sp_per_m_to_dbcm(a_per_m):  return a_per_m * _SP_DBCM_PER_INVM
+
+
+def _sp_dbcm_to_per_m(a_dbcm):   return a_dbcm / _SP_DBCM_PER_INVM
+
+
+def _sp_set_near_n(mode, n_target) -> None:
+    """
+    Seed the FDE eigensolver to search near a target effective index.
+    Version-tolerant: set whichever of these properties this build exposes.
+    This is the key robustness fix for leaky bent modes (mode finding).
+    Identical to Cell 4 _rr_set_near_n.
+    """
+    for _p, _v in (("use max index", 0),
+                   ("search", "near n"),
+                   ("n", float(n_target))):
+        try:
+            mode.set(_p, _v)
+        except Exception:
+            pass
+
+
+def _sp_build_fde(mode, radius_m: float, wavelength_m: float,
+                  for_loss: bool = False, neff_guess=None) -> None:
     """
     Build bent-waveguide FDE cross-section for one (R, λ) point.
     Geometry is IDENTICAL to Cell 4 _rr_build_fde except:
@@ -51,11 +76,20 @@ def _sp_build_fde(mode, radius_m: float, wavelength_m: float) -> None:
     Stack (bottom to top along Z):
       SiO₂ substrate  →  SiN core 400 nm  →  SiO₂ upper cladding
     Cross-section:  Y = width axis (1000 nm),  Z = height axis (400 nm)
+
+    for_loss=False : original LIGHT geometry, default search (n_g stencil).
+    for_loss=True  : WIDE lateral domain + PML, more trial modes, and (when a
+                     neff_guess is given) a "near n" search so the leaky
+                     fundamental is reliably found.
     """
     m = mode
     m.switchtolayout()
     m.selectall()
     m.delete()
+
+    _yspan_um = _sp_y_span_loss_um if for_loss else _sp_y_span_um
+    _mesh_y   = _sp_mesh_y_loss    if for_loss else MESH_CELLS_Y
+    _n_trial  = (SPEC_LOSS_TRIAL_MODES if for_loss else N_MODES_REQUEST)
 
     # ── FDE solver ────────────────────────────────────────────────────────────
     m.addfde()
@@ -63,21 +97,32 @@ def _sp_build_fde(mode, radius_m: float, wavelength_m: float) -> None:
     m.set("x",                     0.0)
     m.set("y",                     0.0)
     m.set("z",                     _sp_z_ctr      * 1e-6)
-    m.set("y span",                _sp_y_span_um  * 1e-6)
+    m.set("y span",                _yspan_um      * 1e-6)
     m.set("z span",                _sp_z_span_um  * 1e-6)
     m.set("wavelength",            wavelength_m)
-    m.set("number of trial modes", N_MODES_REQUEST)
-    m.set("mesh cells y",          MESH_CELLS_Y)
+    m.set("number of trial modes", _n_trial)
+    m.set("mesh cells y",          _mesh_y)
     m.set("mesh cells z",          MESH_CELLS_Z)
     m.set("bent waveguide",        1)
     m.set("bend radius",           radius_m)
     m.set("bend orientation",      0)      # 0 = curvature centre along +Y → ring in XY plane
 
+    # PML on all outer boundaries for the loss solve so the radiated tail is
+    # absorbed (a metal boundary gives a trapped, real-neff mode => Im=0).
+    if for_loss and SPEC_USE_PML_FOR_LOSS:
+        for _bc in ("y min bc", "y max bc", "z min bc", "z max bc"):
+            m.set(_bc, "PML")
+        m.set("pml layers", SPEC_PML_LAYERS)
+
+    # seed the eigensolver near the known real n_eff (robust mode finding)
+    if for_loss and (neff_guess is not None):
+        _sp_set_near_n(m, neff_guess)
+
     # ── Background (SiO₂ upper cladding — fills entire domain) ───────────────
     m.addrect()
     m.set("name",     "SP_bg")
     m.set("x",        0.0);  m.set("x span", 1.0e-6)
-    m.set("y",        0.0);  m.set("y span", _sp_y_span_um  * 1e-6)
+    m.set("y",        0.0);  m.set("y span", _yspan_um      * 1e-6)
     m.set("z",        _sp_z_ctr      * 1e-6)
     m.set("z span",   _sp_z_span_um  * 1e-6)
     m.set("material", "<Object defined dielectric>")
@@ -87,7 +132,7 @@ def _sp_build_fde(mode, radius_m: float, wavelength_m: float) -> None:
     m.addrect()
     m.set("name",     "SP_lower_clad")
     m.set("x",        0.0);  m.set("x span", 1.0e-6)
-    m.set("y",        0.0);  m.set("y span", _sp_y_span_um  * 1e-6)
+    m.set("y",        0.0);  m.set("y span", _yspan_um      * 1e-6)
     m.set("z",        _sp_sio2_z_ctr * 1e-6)
     m.set("z span",   _sp_sio2_z_span * 1e-6)
     m.set("material", "<Object defined dielectric>")
@@ -103,27 +148,74 @@ def _sp_build_fde(mode, radius_m: float, wavelength_m: float) -> None:
     m.set("index",    N_SIN_FIXED)         # SiN = 1.99
 
 
-def _sp_solve_neff(mode, radius_m: float, wavelength_m: float):
+def _sp_collect_modes(mode, n_try: int):
+    """
+    Robustly collect found modes as a list of (k, neff_complex, te_fraction)
+    by reading mode1..mode<n_try> and stopping at the first that is absent.
+    Returns [] if findmodes produced nothing (so the caller can handle it).
+    Identical to Cell 4 _rr_collect_modes.
+    """
+    out = []
+    for k in range(1, n_try + 1):
+        try:
+            nc = complex(np.asarray(
+                mode.getdata(f"FDE::data::mode{k}", "neff")).flat[0])
+            te = float(np.asarray(
+                mode.getdata(f"FDE::data::mode{k}", "TE polarization fraction")).flat[0])
+        except Exception:
+            break
+        out.append((k, nc, te))
+    return out
+
+
+def _sp_solve_neff(mode, radius_m: float, wavelength_m: float,
+                   for_loss: bool = False, neff_guess=None):
     """
     One complete FDE solve at (radius_m, wavelength_m).
-    Returns (Re(neff), TE_polarisation_fraction) for mode 1.
-    Identical to Cell 4 _rr_solve_neff.
+    Returns (Re(neff), Im(neff), TE fraction, loss_dB_per_m).
+    loss_dB_per_m is only read for the loss solve (else NaN).
+
+    Light solve (for_loss=False): selects mode1 (fundamental) — unchanged, so
+                                  neff / ng / FSR stay bit-for-bit identical.
+    Loss solve  (for_loss=True) : selects the TE-like mode whose Re(neff) is
+                                  closest to neff_guess (robust against leaky /
+                                  spurious PML modes); raises if NO mode found.
     """
-    _sp_build_fde(mode, radius_m, wavelength_m)
+    _n_try = SPEC_LOSS_TRIAL_MODES if for_loss else N_MODES_REQUEST
+    _sp_build_fde(mode, radius_m, wavelength_m,
+                  for_loss=for_loss, neff_guess=neff_guess)
     mode.run()
     mode.findmodes()
-    raw_neff = mode.getdata("FDE::data::mode1", "neff")
-    raw_te   = mode.getdata("FDE::data::mode1", "TE polarization fraction")
-    neff_c   = complex(np.asarray(raw_neff).flat[0])
-    te_v     = float(np.asarray(raw_te).flat[0])
-    return neff_c.real, te_v
+
+    found = _sp_collect_modes(mode, _n_try)
+    if not found:
+        raise RuntimeError(
+            f"findmodes found no modes (R={radius_m*1e6:.3f} um, "
+            f"lam={wavelength_m*1e9:.1f} nm, for_loss={for_loss})")
+
+    if for_loss and (neff_guess is not None):
+        _te_like = [mm for mm in found if mm[2] >= 0.5] or found
+        sel = min(_te_like, key=lambda mm: abs(mm[1].real - neff_guess))
+    else:
+        sel = found[0]                       # fundamental = mode1 (original)
+    ksel, nc, te_v = sel
+
+    loss_dbm = np.nan
+    if for_loss:
+        try:
+            loss_dbm = float(np.asarray(
+                mode.getdata(f"FDE::data::mode{ksel}", "loss")).flat[0])
+        except Exception:
+            loss_dbm = 4.0 * np.pi * abs(nc.imag) / wavelength_m * (10.0 / np.log(10))
+    return nc.real, nc.imag, te_v, loss_dbm
 
 
 def _sp_neff_ng(mode, radius_m: float, lam0_m: float, dlam_m: float):
     """
     Three-point central-difference group index at lam0 for a given radius.
-    Identical to Cell 4 _rr_neff_ng, but lam0 and dlam are explicit arguments
-    so the function works for any of the 13 ring wavelengths.
+    Identical to Cell 4 _rr_fsr_stencil, but lam0 and dlam are explicit
+    arguments so the function works for any of the 13 ring wavelengths.
+    Uses LIGHT solves only (for_loss=False), so n_g is unchanged.
 
     Returns (neff_at_lam0, ng, te_frac, neff_lo, neff_hi).
 
@@ -132,14 +224,23 @@ def _sp_neff_ng(mode, radius_m: float, lam0_m: float, dlam_m: float):
     lam_lo_m = lam0_m - dlam_m
     lam_hi_m = lam0_m + dlam_m
 
-    neff_lo, _    = _sp_solve_neff(mode, radius_m, lam_lo_m)
-    neff_0,  te_v = _sp_solve_neff(mode, radius_m, lam0_m)
-    neff_hi, _    = _sp_solve_neff(mode, radius_m, lam_hi_m)
+    neff_lo, _, _,    _ = _sp_solve_neff(mode, radius_m, lam_lo_m, for_loss=False)
+    neff_0,  _, te_v, _ = _sp_solve_neff(mode, radius_m, lam0_m,   for_loss=False)
+    neff_hi, _, _,    _ = _sp_solve_neff(mode, radius_m, lam_hi_m, for_loss=False)
 
     dneff_dlam    = (neff_hi - neff_lo) / (2.0 * dlam_m)
     ng            = neff_0 - lam0_m * dneff_dlam
 
     return neff_0, ng, te_v, neff_lo, neff_hi
+
+
+def _sp_loss_solve(mode, radius_m: float, lam0_m: float, neff_guess: float):
+    """One PML solve at the ring's λₙ (seeded near neff_guess)
+    -> (Im(neff), loss_dB/m).  Mirrors Cell 4 _rr_loss_solve but the
+    wavelength is explicit so each ring uses its own λₙ."""
+    _, nimag, _, loss_dbm = _sp_solve_neff(mode, radius_m, lam0_m,
+                                           for_loss=True, neff_guess=neff_guess)
+    return nimag, loss_dbm
 
 
 def _sp_make_group_path(ring_idx, lam_nm, r_min_um, r_max_um, n_radii):
@@ -156,7 +257,10 @@ def _sp_init_group(hf, grp_path, ring_idx, lam_nm,
                    r_min_um, r_max_um, radii_um, dlam_nm):
     """
     Pre-allocate all datasets for one ring sweep inside an already-open
-    h5py file.  Safe to call on an existing group (idempotent via setdefault).
+    h5py file.  Safe to call on an existing group (idempotent): only MISSING
+    datasets/attrs are created, so an older FSR-only group gains the new
+    bend-loss datasets without touching existing data. loss_computed is seeded
+    from existing Im(neff) finiteness so prior bend-loss runs are not redone.
     Mirrors Cell 4 _rr_init_hdf5 exactly.
     """
     N  = len(radii_um)
@@ -178,6 +282,11 @@ def _sp_init_group(hf, grp_path, ring_idx, lam_nm,
     mg.attrs.setdefault("bend_orientation", 0)
     mg.attrs.setdefault("version_name",     VERSION_NAME_SIO2)
     mg.attrs.setdefault("timestamp_start",  datetime.now().isoformat())
+    # NEW bend-loss metadata (always refreshed)
+    mg.attrs["schema"]          = "v2_bendloss"
+    mg.attrs["y_span_loss_um"]  = _sp_y_span_loss_um
+    mg.attrs["pml_layers"]      = SPEC_PML_LAYERS
+    mg.attrs["alpha_prop_dbcm"] = SPEC_ALPHA_PROP_DBCM
 
     if "radii_um" not in mg:
         mg.create_dataset("radii_um",      data=radii_um)
@@ -189,7 +298,8 @@ def _sp_init_group(hf, grp_path, ring_idx, lam_nm,
 
     _nan = np.full(N, np.nan, dtype=np.float64)
     rg   = g.require_group("results")
-    for ds in ("neff", "ng", "te_frac", "ngL_um", "neff_lo", "neff_hi"):
+    for ds in ("neff", "ng", "te_frac", "ngL_um", "neff_lo", "neff_hi",
+               "neff_imag", "alpha_bend_dbcm", "loss_dbm"):
         if ds not in rg:
             rg.create_dataset(ds, data=_nan.copy(), chunks=(N,))
 
@@ -197,13 +307,18 @@ def _sp_init_group(hf, grp_path, ring_idx, lam_nm,
     if "computed" not in fg:
         fg.create_dataset("computed",
                           data=np.zeros(N, dtype=bool), chunks=(N,))
+    if "loss_computed" not in fg:
+        # seed from any existing Im(neff) so prior bend-loss runs are not redone
+        _seed = (np.isfinite(rg["neff_imag"][:]) if "neff_imag" in rg
+                 else np.zeros(N, dtype=bool))
+        fg.create_dataset("loss_computed", data=_seed, chunks=(N,))
 
 
 def _sp_load_cache(hf, grp_path, N):
     """
     Read all result arrays for one ring from an open HDF5 file.
-    Returns six float64 arrays (all in SI metres where applicable)
-    plus the boolean computed mask.
+    Returns the FSR arrays (with ngL in metres), the NEW bend-loss arrays,
+    and both boolean flags.
 
     NOTE: ngL is stored in µm in HDF5 → converted to metres on load,
     consistent with Cell 4 _rr_load_cache.
@@ -212,15 +327,20 @@ def _sp_load_cache(hf, grp_path, N):
     rg = g["results"]
     fg = g["flags"]
 
-    neff_a    = rg["neff"][:]
-    ng_a      = rg["ng"][:]
-    te_a      = rg["te_frac"][:]
-    ngL_a     = rg["ngL_um"][:] * 1e-6     # µm → m
-    neff_lo_a = rg["neff_lo"][:]
-    neff_hi_a = rg["neff_hi"][:]
-    computed  = fg["computed"][:]
+    neff_a       = rg["neff"][:]
+    ng_a         = rg["ng"][:]
+    te_a         = rg["te_frac"][:]
+    ngL_a        = rg["ngL_um"][:] * 1e-6     # µm → m
+    neff_lo_a    = rg["neff_lo"][:]
+    neff_hi_a    = rg["neff_hi"][:]
+    neff_imag_a  = rg["neff_imag"][:]
+    alpha_bend_a = rg["alpha_bend_dbcm"][:]
+    loss_dbm_a   = rg["loss_dbm"][:]
+    computed     = fg["computed"][:]
+    loss_done    = fg["loss_computed"][:]
 
-    return neff_a, ng_a, te_a, ngL_a, neff_lo_a, neff_hi_a, computed
+    return (neff_a, ng_a, te_a, ngL_a, neff_lo_a, neff_hi_a,
+            neff_imag_a, alpha_bend_a, loss_dbm_a, computed, loss_done)
 
 
 def _sp_phase_match(radii_um_v, neff_v, ng_v, lam0_m, ngL_v_m, fsr_m):
@@ -304,17 +424,24 @@ def run(state=None):
     between steps (the notebook's old kernel globals + bridge).
     Returns the updated `state`."""
     state = {} if state is None else state
-    global N_SPEC_RINGS, SPEC_DELTA_LAM_NG_NM, SPEC_DELTA_LAM_NM, SPEC_FSR_NM, SPEC_LAM0_NM, SPEC_LAM_NM, SPEC_N_RADII, SPEC_N_UPPER, SPEC_R_HALF_SPAN_UM, SPEC_R_MIN_FLOOR_UM, SPEC_WG_WIDTH_NM, _H1, _H2, _H3, _L_m, _N_n, _PM_MAX_ITER, _PM_TOL_M, _R_est_um, _R_m, _R_um, _SEP, _SEP2, _any_uncached, _bi_local, _cbar, _cmap, _cnorm, _colors, _comp_n, _delta, _dlam_ng_m, _dneff_dlam_str, _dng, _el, _elapsed, _eta, _ext, _fig_stem, _fsr_all, _fsr_m, _glv, _gp, _grp_paths, _gv, _hdr, _i, _lam0_n_m, _lam0_n_nm, _lam_m_arr, _lam_nm_arr, _lam_v, _n, _n_cached, _neff_n, _neff_str, _neff_str_fit, _neff_v, _ngL_m, _ngL_m_i, _ngL_n, _ng_all, _ng_n, _ng_str, _ng_v, _nhi_n, _nhi_v, _nlo_n, _nlo_v, _nv, _pm, _poly_str, _r_all, _radii_um_n, _rate, _remaining, _rfsr_v, _rg, _rmax, _rmin, _rpm_v, _runs, _rv, _sm, _sp_core_t_um, _sp_half_t_um, _sp_hf, _sp_mode, _sp_sio2_z_ctr, _sp_sio2_z_span, _sp_wg_w_m, _sp_y_span_um, _sp_z_above_um, _sp_z_below_um, _sp_z_ctr, _sp_z_span_um, _spec_r_max, _spec_r_min, _spec_radii_um, _spec_results, _spec_w_idx, _spec_w_nm, _spec_w_um, _t0, _target_ngL_n_m, _target_ngL_n_um, _te, _te_n, _te_str, _te_v, _tgt, _valid_idx, _valid_n, _valid_str, _vn, _wl_str_m, ax00, ax01, ax10, ax11, axes, fig, spec_FSR_pm_nm, spec_L_pm_um, spec_R_pm_um, spec_lam_res_pm_nm, spec_m, spec_neff_pm, spec_ng_pm
+    global N_SPEC_RINGS, SPEC_ALPHA_PROP_DBCM, SPEC_DELTA_LAM_NG_NM, SPEC_DELTA_LAM_NM, SPEC_FSR_NM, SPEC_FWHM_NM, SPEC_LAM0_NM, SPEC_LAM_NM, SPEC_LOSS_TRIAL_MODES, SPEC_MESH_DY_NM, SPEC_N_RADII, SPEC_N_UPPER, SPEC_PML_LAYERS, SPEC_R_HALF_SPAN_UM, SPEC_R_MIN_FLOOR_UM, SPEC_USE_PML_FOR_LOSS, SPEC_WG_WIDTH_NM, SPEC_Y_SPAN_LOSS_UM, _H1, _H2, _H3, _H4, _L_m, _N_n, _PM_MAX_ITER, _PM_TOL_M, _R_est_um, _R_m, _R_um, _SEP, _SEP2, _SP_DBCM_PER_INVM, _a_bend_match, _a_bend_per_m, _a_dbcm, _a_tot_dbcm, _ab_all, _ab_b, _ab_fin, _abend_n, _any_pos, _any_uncached, _av, _c, _cbar, _cmap, _cnorm, _colors, _comp_n, _delta, _dlam_ng_m, _dneff_dlam_str, _dng, _done_n, _el, _elapsed, _eta, _ext, _fig5_stem, _fig_stem, _fsr_all, _fsr_m, _fsr_was_cached, _glv, _gp, _grp_paths, _gv, _hdr, _i, _l, _lam0_n_m, _lam0_n_nm, _lam_b, _lam_m_arr, _lam_nm_arr, _lam_v, _loss_dbm, _loss_n, _lossdbm_n, _match_full_idx, _n, _n_done, _n_fsr_only, _neff_n, _neff_str, _neff_str_fit, _neff_v, _ngL_m, _ngL_m_i, _ngL_n, _ng_all, _ng_n, _ng_str, _ng_v, _nhi_n, _nhi_v, _nimag, _nimag_n, _nlo_n, _nlo_v, _nv, _ok, _pm, _poly_str, _r_all, _radii_um_n, _rate, _ratio, _remaining, _rfsr_v, _rg, _rmax, _rmin, _rpm_v, _runs, _rv, _sm, _sp_core_t_um, _sp_half_t_um, _sp_hf, _sp_mesh_y_loss, _sp_mode, _sp_sio2_z_ctr, _sp_sio2_z_span, _sp_wg_w_m, _sp_y_span_loss_um, _sp_y_span_um, _sp_z_above_um, _sp_z_below_um, _sp_z_ctr, _sp_z_span_um, _spec_r_max, _spec_r_min, _spec_radii_um, _spec_results, _spec_w_idx, _spec_w_nm, _spec_w_um, _src, _t0, _target_ngL_n_m, _target_ngL_n_um, _te_n, _te_str, _te_v, _tgt, _valid_n, _valid_str, _vn, _wl_str_m, ax00, ax01, ax10, ax11, axb0, axb1, axes, fig, fig5, spec_FSR_pm_nm, spec_L_pm_um, spec_Q_bend, spec_Q_i_total, spec_R_pm_um, spec_alpha_bend_dbcm, spec_alpha_total_dbcm, spec_lam_res_pm_nm, spec_m, spec_neff_imag, spec_neff_pm, spec_ng_pm
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
     SPEC_WG_WIDTH_NM    = RR_WG_WIDTH_NM        # 1000 nm  — inherited
     SPEC_FSR_NM         = RR_FSR_NM             # 10.0 nm  — inherited
     SPEC_N_UPPER        = N_UPPER_CLADDING_SIO2 # 1.4469   — SiO₂ symmetric
+    SPEC_FWHM_NM        = 0.5                   # [nm]  design FWHM (for the Q_loaded summary)
     SPEC_N_RADII        = 100
     SPEC_R_HALF_SPAN_UM = 19    # [µm]  search half-width around analytical estimate
     SPEC_R_MIN_FLOOR_UM = 20    # [µm]  absolute lower bound (bend loss guard)
     SPEC_DELTA_LAM_NG_NM = 5.0   # [nm]
+    SPEC_USE_PML_FOR_LOSS = True    # PML boundaries for the loss solve (False = loss-blind)
+    SPEC_Y_SPAN_LOSS_UM   = 16.0    # [µm]  widened lateral span so the PML is past the caustic
+    SPEC_MESH_DY_NM       = 50.0    # [nm]  target y cell size over the widened span
+    SPEC_PML_LAYERS       = 16      # PML layers (raise if alpha_bend is not converged)
+    SPEC_LOSS_TRIAL_MODES = 12      # trial modes for the (leaky) loss solve — more = safer
+    SPEC_ALPHA_PROP_DBCM  = 1.0     # [dB/cm] assumed propagation loss, for the total-Q summary
     _PM_TOL_M    = 1e-13    # |ΔR| < 0.1 pm
     _PM_MAX_ITER = 20
     _sp_core_t_um    = CORE_THICKNESS_UM
@@ -327,6 +454,10 @@ def run(state=None):
     _sp_sio2_z_span  = _sp_z_below_um
     _sp_z_ctr        = (_sp_z_above_um - _sp_z_below_um) / 2.0
     _sp_wg_w_m       = SPEC_WG_WIDTH_NM * 1e-9
+    _sp_y_span_loss_um = SPEC_Y_SPAN_LOSS_UM if SPEC_USE_PML_FOR_LOSS else _sp_y_span_um
+    _sp_mesh_y_loss    = (int(round(_sp_y_span_loss_um * 1e3 / SPEC_MESH_DY_NM))
+                          if SPEC_USE_PML_FOR_LOSS else MESH_CELLS_Y)
+    _SP_DBCM_PER_INVM = (10.0 / np.log(10)) / 100.0          # 1/m -> dB/cm
     print("=" * 70)
     print("  SPECTROMETER RING ARRAY — SiO₂/SiN/SiO₂  (symmetric cladding)")
     print("=" * 70)
@@ -338,8 +469,11 @@ def run(state=None):
     print(f"  n_core         : {N_SIN_FIXED}    n_clad = {SPEC_N_UPPER} (SiO₂)")
     print(f"  Target FSR     : {SPEC_FSR_NM:.1f} nm")
     print(f"  Radii/ring     : {SPEC_N_RADII}")
-    print(f"  ng stencil     : ±{SPEC_DELTA_LAM_NG_NM:.1f} nm  (3 FDE/radius → "
-          f"{SPEC_N_RADII*3} solves/ring if uncached)")
+    print(f"  ng stencil     : ±{SPEC_DELTA_LAM_NG_NM:.1f} nm  (3 light solves for n_g + "
+          f"1 PML solve for loss, per radius)")
+    print(f"  Bend-loss solve: PML={SPEC_USE_PML_FOR_LOSS}, "
+          f"y span {_sp_y_span_loss_um:.1f} µm, mesh_y {_sp_mesh_y_loss}, "
+          f"{SPEC_PML_LAYERS} PML layers, near-n seed, {SPEC_LOSS_TRIAL_MODES} trial modes")
     print(f"  HDF5 file      : {HDF5_PATH_SIO2}")
     print("=" * 70)
     print()
@@ -378,7 +512,7 @@ def run(state=None):
     print(f"\n  Estimated radius range:  "
           f"{_R_est_um.min():.4f} – {_R_est_um.max():.4f} µm  "
           f"(straight ng estimate)\n")
-    _spec_results = {}   # ring_idx → dict from _sp_phase_match + raw arrays
+    _spec_results = {}   # ring_idx → dict from _sp_phase_match + raw arrays + bend loss
     _grp_paths = []
     for _n in range(N_SPEC_RINGS):
         _gp = _sp_make_group_path(
@@ -390,17 +524,16 @@ def run(state=None):
     _any_uncached = False
     for _n in range(N_SPEC_RINGS):
         _gp = _grp_paths[_n]
-        if _gp not in _sp_hf:
-            _sp_init_group(
-                _sp_hf, _gp, _n, float(_lam_nm_arr[_n]),
-                _spec_r_min[_n], _spec_r_max[_n],
-                _spec_radii_um[_n], SPEC_DELTA_LAM_NG_NM,
-            )
-            _sp_hf.flush()
+        _sp_init_group(
+            _sp_hf, _gp, _n, float(_lam_nm_arr[_n]),
+            _spec_r_min[_n], _spec_r_max[_n],
+            _spec_radii_um[_n], SPEC_DELTA_LAM_NG_NM,
+        )
+        _sp_hf.flush()
+        _c = _sp_hf[_gp]["flags"]["computed"][:]
+        _l = _sp_hf[_gp]["flags"]["loss_computed"][:]
+        if not (_c & _l).all():
             _any_uncached = True
-        else:
-            if not _sp_hf[_gp]["flags"]["computed"][:].all():
-                _any_uncached = True
     _sp_mode = None
     if _any_uncached:
         log.info("Launching MODE session for spectrometer ring sweeps …")
@@ -418,38 +551,43 @@ def run(state=None):
         _target_ngL_n_um = _target_ngL_n_m * 1e6
 
         # ── Load cache into fresh in-memory arrays ────────────────────────────────
-        # These arrays mirror Cell 4 _neff_arr, _ng_arr etc. exactly.
-        _neff_n, _ng_n, _te_n, _ngL_n, _nlo_n, _nhi_n, _comp_n = \
+        # These arrays mirror Cell 4 _neff_arr, _ng_arr, _alpha_bend_arr etc. exactly.
+        (_neff_n, _ng_n, _te_n, _ngL_n, _nlo_n, _nhi_n,
+         _nimag_n, _abend_n, _lossdbm_n, _comp_n, _loss_n) = \
             _sp_load_cache(_sp_hf, _gp, _N_n)
         # _ngL_n is in METRES after _sp_load_cache
 
-        _n_cached  = int(_comp_n.sum())
-        _remaining = _N_n - _n_cached
+        _done_n     = _comp_n & _loss_n
+        _n_done     = int(_done_n.sum())
+        _n_fsr_only = int((_comp_n & ~_loss_n).sum())
+        _remaining  = _N_n - _n_done
 
         log.info(
             f"Ring {_n:02d} │ λ={_lam0_n_nm:.6f} nm │ "
             f"R=[{_radii_um_n[0]:.3f}, {_radii_um_n[-1]:.3f}] µm │ "
             f"target ng·L={_target_ngL_n_um:.4f} µm │ "
-            f"cached {_n_cached}/{_N_n}"
+            f"done {_n_done}/{_N_n}"
+            + (f"  (+{_n_fsr_only} FSR-only → loss solve only)" if _n_fsr_only else "")
         )
 
         # ── Print table header for this ring ─────────────────────────────────────
         _hdr = (f"  {'R (µm)':>10}  {'neff':>10}  {'ng':>10}  "
-                f"{'TE':>6}  {'ng·L (µm)':>12}  {'Δ/tgt':>9}  src")
+                f"{'TE':>6}  {'ng·L (µm)':>12}  {'a_bend(dB/cm)':>14}  {'Δ/tgt':>9}  src")
         print(f"\n  Ring {_n:02d} │ λ₀ = {_lam0_n_nm:.4f} nm  "
               f"│ target ng·L = {_target_ngL_n_um:.4f} µm")
         print(_hdr)
         print("  " + "─" * (len(_hdr) - 2))
 
-        # Print cached rows immediately so table is contiguous
+        # Print fully-cached rows immediately so the table is contiguous
         for _i in range(_N_n):
-            if _comp_n[_i]:
+            if _done_n[_i]:
                 _ngL_m_i = _ngL_n[_i]          # already in metres
                 _delta   = (_ngL_m_i - _target_ngL_n_m) / _target_ngL_n_m * 100.0
                 print(
                     f"  {_radii_um_n[_i]:>10.4f}  {_neff_n[_i]:>10.6f}  "
                     f"{_ng_n[_i]:>10.6f}  {_te_n[_i]:>6.4f}  "
-                    f"{_ngL_m_i*1e6:>12.4f}  {_delta:>+8.3f}%  cache"
+                    f"{_ngL_m_i*1e6:>12.4f}  {_abend_n[_i]:>14.4f}  "
+                    f"{_delta:>+8.3f}%  cache\n"
                 )
 
         # ── FDE sweep for missing rows ────────────────────────────────────────────
@@ -458,49 +596,86 @@ def run(state=None):
             _runs     = 0
 
             for _i, _R_um in enumerate(_radii_um_n):
-                if _comp_n[_i]:
-                    continue
+                if _comp_n[_i] and _loss_n[_i]:
+                    continue   # fully done — skip
 
+                _fsr_was_cached = bool(_comp_n[_i])
                 _R_m = _R_um * 1e-6
-                try:
-                    _neff_v, _ng_v, _te_v, _nlo_v, _nhi_v = \
-                        _sp_neff_ng(_sp_mode, _R_m, _lam0_n_m, _dlam_ng_m)
-                except Exception as _exc:
-                    log.warning(f"  Ring {_n:02d} │ R={_R_um:.4f} µm FAILED: {_exc}")
-                    # Mark failed row so re-run does not retry it
+
+                # ── (a) FSR stencil (n_g) — only if not already cached ───────────
+                if not _comp_n[_i]:
+                    try:
+                        _neff_v, _ng_v, _te_v, _nlo_v, _nhi_v = \
+                            _sp_neff_ng(_sp_mode, _R_m, _lam0_n_m, _dlam_ng_m)
+                    except Exception as _exc:
+                        log.warning(f"  Ring {_n:02d} │ R={_R_um:.4f} µm FSR solve FAILED: {_exc}")
+                        # give up this radius entirely (avoid retrying a broken setup)
+                        _comp_n[_i] = True
+                        _loss_n[_i] = True
+                        _sp_hf[f"{_gp}/flags/computed"][_i]      = True
+                        _sp_hf[f"{_gp}/flags/loss_computed"][_i] = True
+                        _sp_hf.flush()
+                        continue
+
+                    _L_m   = 2.0 * np.pi * _R_m
+                    _ngL_m = _ng_v * _L_m          # [m]
+
+                    # Memory arrays (ngL in metres — same as Cell 4)
+                    _neff_n[_i] = _neff_v
+                    _ng_n  [_i] = _ng_v
+                    _te_n  [_i] = _te_v
+                    _ngL_n [_i] = _ngL_m           # metres
+                    _nlo_n [_i] = _nlo_v
+                    _nhi_n [_i] = _nhi_v
                     _comp_n[_i] = True
+
+                    # HDF5 — write immediately (fault-safe), ngL stored in µm
+                    _rg = _sp_hf[f"{_gp}/results"]
+                    _rg["neff"]   [_i] = _neff_v
+                    _rg["ng"]     [_i] = _ng_v
+                    _rg["te_frac"][_i] = _te_v
+                    _rg["ngL_um"] [_i] = _ngL_m * 1e6   # µm in HDF5
+                    _rg["neff_lo"][_i] = _nlo_v
+                    _rg["neff_hi"][_i] = _nhi_v
                     _sp_hf[f"{_gp}/flags/computed"][_i] = True
                     _sp_hf.flush()
-                    continue
+                else:
+                    _neff_v = _neff_n[_i]      # reuse cached FSR result as the seed
 
-                _L_m   = 2.0 * np.pi * _R_m
-                _ngL_m = _ng_v * _L_m          # [m]
+                # ── (b) radiative bend loss — PML solve seeded by Re(neff) ───────
+                try:
+                    _nimag, _loss_dbm = _sp_loss_solve(
+                        _sp_mode, _R_m, _lam0_n_m, neff_guess=_neff_v)
+                except Exception as _exc:
+                    log.warning(f"  Ring {_n:02d} │ R={_R_um:.4f} µm bend-loss solve "
+                                f"FAILED: {_exc}; alpha_bend set to NaN (FSR data kept)")
+                    _nimag, _loss_dbm = np.nan, np.nan
 
-                # Memory arrays (ngL in metres — same as Cell 4)
-                _neff_n[_i] = _neff_v
-                _ng_n  [_i] = _ng_v
-                _te_n  [_i] = _te_v
-                _ngL_n [_i] = _ngL_m           # metres
-                _nlo_n [_i] = _nlo_v
-                _nhi_n [_i] = _nhi_v
-                _comp_n[_i] = True
+                if np.isfinite(_nimag):
+                    _a_dbcm = _sp_per_m_to_dbcm(4.0 * np.pi * abs(_nimag) / _lam0_n_m)
+                else:
+                    _a_dbcm = np.nan
 
-                # HDF5 — write immediately (fault-safe), ngL stored in µm
+                _nimag_n  [_i] = _nimag
+                _abend_n  [_i] = _a_dbcm
+                _lossdbm_n[_i] = _loss_dbm
+                _loss_n   [_i] = True
+
                 _rg = _sp_hf[f"{_gp}/results"]
-                _rg["neff"]   [_i] = _neff_v
-                _rg["ng"]     [_i] = _ng_v
-                _rg["te_frac"][_i] = _te_v
-                _rg["ngL_um"] [_i] = _ngL_m * 1e6   # µm in HDF5
-                _rg["neff_lo"][_i] = _nlo_v
-                _rg["neff_hi"][_i] = _nhi_v
-                _sp_hf[f"{_gp}/flags/computed"][_i] = True
+                _rg["neff_imag"]      [_i] = _nimag
+                _rg["alpha_bend_dbcm"][_i] = _a_dbcm
+                _rg["loss_dbm"]       [_i] = _loss_dbm
+                _sp_hf[f"{_gp}/flags/loss_computed"][_i] = True
                 _sp_hf.flush()
 
                 _runs  += 1
+                _ngL_m  = _ngL_n[_i]
                 _delta  = (_ngL_m - _target_ngL_n_m) / _target_ngL_n_m * 100.0
+                _src    = "loss" if _fsr_was_cached else "FDE"
                 print(
-                    f"  {_R_um:>10.4f}  {_neff_v:>10.6f}  {_ng_v:>10.6f}  "
-                    f"{_te_v:>6.4f}  {_ngL_m*1e6:>12.4f}  {_delta:>+8.3f}%  FDE"
+                    f"  {_R_um:>10.4f}  {_neff_n[_i]:>10.6f}  {_ng_n[_i]:>10.6f}  "
+                    f"{_te_n[_i]:>6.4f}  {_ngL_m*1e6:>12.4f}  {_a_dbcm:>14.4f}  "
+                    f"{_delta:>+8.3f}%  {_src:>4}\n"
                 )
 
                 if _runs % 10 == 0 or _runs == _remaining:
@@ -509,8 +684,8 @@ def run(state=None):
                     _eta  = (_remaining - _runs) / _rate
                     log.info(
                         f"  Ring {_n:02d} [{_runs:3d}/{_remaining}]  "
-                        f"R={_R_um:.3f} µm  ng={_ng_v:.6f}  "
-                        f"ngL={_ngL_m*1e6:.4f} µm  Δ={_delta:+.3f}%  "
+                        f"R={_R_um:.3f} µm  ng={_ng_n[_i]:.6f}  "
+                        f"a_bend={_a_dbcm:.4f} dB/cm  Δ={_delta:+.3f}%  "
                         f"ETA {_eta:.0f} s"
                     )
 
@@ -518,16 +693,15 @@ def run(state=None):
             _sp_hf[_gp]["metadata"].attrs["timestamp_end"]  = \
                 datetime.now().isoformat()
             _sp_hf[_gp]["metadata"].attrs["runs_completed"] = \
-                int(_comp_n.sum())
+                int((_comp_n & _loss_n).sum())
             _sp_hf.flush()
             _elapsed = time.time() - _t0
             log.info(
                 f"  Ring {_n:02d} done  "
-                f"({_runs} new FDE groups in {_elapsed:.1f} s,  "
-                f"avg {_elapsed/max(_runs*3,1):.2f} s/solve)"
+                f"({_runs} radii processed in {_elapsed:.1f} s)"
             )
 
-        # ── Phase matching — always from in-memory arrays ─────────────────────────
+        # ── Phase matching — always from in-memory FSR arrays (unchanged) ────────
         _valid_n = ~np.isnan(_ng_n)
         if not np.any(_valid_n):
             log.error(f"Ring {_n:02d}: ALL rows failed — check warnings above.")
@@ -551,6 +725,31 @@ def run(state=None):
         _pm["ng_arr"]        = _ng_n.copy()
         _pm["ngL_arr_m"]     = _ngL_n.copy()     # metres
         _pm["valid_mask"]    = _valid_n
+        # NEW — bend-loss arrays
+        _pm["neff_imag_arr"]  = _nimag_n.copy()
+        _pm["alpha_bend_arr"] = _abend_n.copy()  # dB/cm
+        _pm["loss_dbm_arr"]   = _lossdbm_n.copy()
+
+        # ── bend loss at the matched (FSR) radius — mirrors Cell 4 best-match ─────
+        _match_full_idx = int(np.argmin(np.abs(_radii_um_n - _pm["R_fsr_um"])))
+        _a_bend_match   = float(_abend_n[_match_full_idx])
+        _pm["alpha_bend_match_dbcm"] = _a_bend_match
+        _pm["neff_imag_match"]       = float(_nimag_n[_match_full_idx])
+        _pm["loss_dbm_match"]        = float(_lossdbm_n[_match_full_idx])
+
+        if np.isfinite(_a_bend_match):
+            _a_bend_per_m = _sp_dbcm_to_per_m(_a_bend_match)
+            _pm["Q_bend"] = (2.0 * np.pi * _pm["ng_pm"] / (_a_bend_per_m * _lam0_n_m)
+                             if _a_bend_per_m > 0 else float("inf"))
+            _a_tot_dbcm   = SPEC_ALPHA_PROP_DBCM + _a_bend_match
+            _pm["alpha_total_dbcm"] = _a_tot_dbcm
+            _pm["Q_i_total"] = (2.0 * np.pi * _pm["ng_pm"]
+                                / (_sp_dbcm_to_per_m(_a_tot_dbcm) * _lam0_n_m))
+        else:
+            _pm["Q_bend"]           = np.nan
+            _pm["alpha_total_dbcm"] = np.nan
+            _pm["Q_i_total"]        = np.nan
+        _pm["Q_loaded"] = _lam0_n_nm / SPEC_FWHM_NM
 
         _spec_results[_n] = _pm
 
@@ -562,7 +761,8 @@ def run(state=None):
             f"ng={_pm['ng_pm']:.6f}  "
             f"L={_pm['L_pm_um']:.6f} µm  "
             f"FSR={_pm['FSR_pm_nm']:.6f} nm  "
-            f"|Δλ|={_pm['resid_pm_pm']:.5f} pm"
+            f"|Δλ|={_pm['resid_pm_pm']:.5f} pm  "
+            f"a_bend={_pm['alpha_bend_match_dbcm']:.4f} dB/cm"
         )
     if _sp_mode is not None:
         _sp_mode.close()
@@ -593,15 +793,9 @@ def run(state=None):
             print(f"  {_n:>3}  FAILED"); continue
         _pm  = _spec_results[_n]
         _dng = _pm["ng_fsr"] - _pm["ng_straight"]
-        _te  = float(_pm["neff_arr"][_pm["valid_mask"]][
-                        int(np.argmin(np.abs(
-                            _pm["radii_um"][_pm["valid_mask"]] - _pm["R_fsr_um"]
-                        )))]) * 0.0 + 0.994   # placeholder until te stored per-point
-        # TE fraction at FSR-matched radius from the sweep cache
-        _valid_idx = np.where(_pm["valid_mask"])[0]
-        _bi_local  = int(np.argmin(np.abs(
-            _pm["radii_um"][_pm["valid_mask"]] - _pm["R_fsr_um"])))
-        # te_frac is not in _spec_results; retrieve from ngL proxy
+        # TE fraction is not carried in _spec_results; printed as "—" (kept from
+        # the original Cell 10). The per-radius TE fraction lives in the HDF5
+        # results/te_frac dataset if you need it.
         print(
             f"  {_n:>3}  {_pm['lam_nm']:>13.6f}  "
             f"{_pm['neff_straight']:>10.6f}  {_pm['ng_straight']:>10.6f}  "
@@ -650,6 +844,32 @@ def run(state=None):
             f"{_pm['resid_pm_pm']:>11.5f}  {_pm['delta_R_nm']:>+9.3f}"
         )
     print()
+    print("  TABLE 4 — Radiative Bend Loss  (at the phase-matched radius)")
+    print(_SEP)
+    _H4 = (f"  {'n':>3}  {'λ_n (nm)':>13}  {'R_pm (µm)':>12}  "
+           f"{'Im(neff)':>12}  {'a_bend (dB/cm)':>15}  {'Q_bend':>11}  "
+           f"{'a_tot (dB/cm)':>14}  {'Q_i_total':>11}  {'Q_loaded':>11}  {'Qi/QL':>8}")
+    print(_H4)
+    print("  " + "─" * 130)
+    for _n in range(N_SPEC_RINGS):
+        if _n not in _spec_results:
+            print(f"  {_n:>3}  FAILED"); continue
+        _pm    = _spec_results[_n]
+        _ratio = (_pm["Q_i_total"] / _pm["Q_loaded"]
+                  if np.isfinite(_pm["Q_i_total"]) else np.nan)
+        print(
+            f"  {_n:>3}  {_pm['lam_nm']:>13.6f}  {_pm['R_pm_um']:>12.6f}  "
+            f"{_pm['neff_imag_match']:>12.3e}  {_pm['alpha_bend_match_dbcm']:>15.4f}  "
+            f"{_pm['Q_bend']:>11.3e}  {_pm['alpha_total_dbcm']:>14.4f}  "
+            f"{_pm['Q_i_total']:>11.3e}  {_pm['Q_loaded']:>11.3e}  {_ratio:>8.1f}"
+        )
+    print()
+    print("  (Qi/QL >> 1  ⇒  coupling, not radiation, sets the linewidth — same"
+          " argument as the sensor ring.)")
+    if not SPEC_USE_PML_FOR_LOSS:
+        print("  [!] SPEC_USE_PML_FOR_LOSS = False → bend loss is NOT physical "
+              "(set it True).")
+    print()
     print(_SEP2)
     print()
     _fsr_all = np.array([_spec_results[_n]["FSR_pm_nm"]
@@ -658,29 +878,49 @@ def run(state=None):
                          for _n in range(N_SPEC_RINGS) if _n in _spec_results])
     _ng_all  = np.array([_spec_results[_n]["ng_pm"]
                          for _n in range(N_SPEC_RINGS) if _n in _spec_results])
+    _ab_all  = np.array([_spec_results[_n]["alpha_bend_match_dbcm"]
+                         for _n in range(N_SPEC_RINGS) if _n in _spec_results])
+    _ab_fin  = _ab_all[np.isfinite(_ab_all)]
     print(f"  FSR spread   :  {_fsr_all.min():.5f} – {_fsr_all.max():.5f} nm  "
           f"│  Δ = {(_fsr_all.max()-_fsr_all.min())*1e3:.3f} pm")
     print(f"  Radius spread:  {_r_all.min():.4f}  – {_r_all.max():.4f}  µm  "
           f"│  Δ = {(_r_all.max()-_r_all.min())*1e3:.2f} nm")
     print(f"  ng range     :  {_ng_all.min():.6f} – {_ng_all.max():.6f}")
+    if _ab_fin.size:
+        print(f"  a_bend range :  {_ab_fin.min():.4f} – {_ab_fin.max():.4f} dB/cm  "
+              f"(median {np.median(_ab_fin):.4f})")
+    else:
+        print("  a_bend range :  no finite values (check PML / warnings)")
     print()
-    spec_R_pm_um       = np.array([_spec_results[_n]["R_pm_um"]
-                                    for _n in range(N_SPEC_RINGS)])
-    spec_L_pm_um       = np.array([_spec_results[_n]["L_pm_um"]
-                                    for _n in range(N_SPEC_RINGS)])
-    spec_neff_pm       = np.array([_spec_results[_n]["neff_pm"]
-                                    for _n in range(N_SPEC_RINGS)])
-    spec_ng_pm         = np.array([_spec_results[_n]["ng_pm"]
-                                    for _n in range(N_SPEC_RINGS)])
-    spec_FSR_pm_nm     = np.array([_spec_results[_n]["FSR_pm_nm"]
-                                    for _n in range(N_SPEC_RINGS)])
-    spec_lam_res_pm_nm = np.array([_spec_results[_n]["lam_res_pm_nm"]
-                                    for _n in range(N_SPEC_RINGS)])
-    spec_m             = np.array([_spec_results[_n]["m"]
-                                    for _n in range(N_SPEC_RINGS)], dtype=int)
+    spec_R_pm_um         = np.array([_spec_results[_n]["R_pm_um"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_L_pm_um         = np.array([_spec_results[_n]["L_pm_um"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_neff_pm         = np.array([_spec_results[_n]["neff_pm"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_ng_pm           = np.array([_spec_results[_n]["ng_pm"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_FSR_pm_nm       = np.array([_spec_results[_n]["FSR_pm_nm"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_lam_res_pm_nm   = np.array([_spec_results[_n]["lam_res_pm_nm"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_m               = np.array([_spec_results[_n]["m"]
+                                      for _n in range(N_SPEC_RINGS)], dtype=int)
+    spec_neff_imag       = np.array([_spec_results[_n]["neff_imag_match"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_alpha_bend_dbcm = np.array([_spec_results[_n]["alpha_bend_match_dbcm"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_alpha_total_dbcm= np.array([_spec_results[_n]["alpha_total_dbcm"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_Q_bend          = np.array([_spec_results[_n]["Q_bend"]
+                                      for _n in range(N_SPEC_RINGS)])
+    spec_Q_i_total       = np.array([_spec_results[_n]["Q_i_total"]
+                                      for _n in range(N_SPEC_RINGS)])
     print("  Exported arrays (shape = (13,)):")
     for _vn in ("spec_R_pm_um", "spec_L_pm_um", "spec_neff_pm",
-                "spec_ng_pm", "spec_FSR_pm_nm", "spec_lam_res_pm_nm", "spec_m"):
+                "spec_ng_pm", "spec_FSR_pm_nm", "spec_lam_res_pm_nm", "spec_m",
+                "spec_neff_imag", "spec_alpha_bend_dbcm", "spec_alpha_total_dbcm",
+                "spec_Q_bend", "spec_Q_i_total"):
         print(f"    {_vn}")
     print()
     plt.rcParams.update({
@@ -784,31 +1024,87 @@ def run(state=None):
     for _ext in (".png", ".pdf"):
         plt.savefig(str(_fig_stem) + _ext, dpi=150, bbox_inches="tight")
         print(f"  Saved → {str(_fig_stem) + _ext}")
-    plt.show()
+    plt.close('all')
+    fig5, (axb0, axb1) = plt.subplots(1, 2, figsize=(15, 5))
+    fig5.suptitle(
+        f"Spectrometer Ring Array — Radiative Bend Loss  │  "
+        f"PML, y span {_sp_y_span_loss_um:.0f} µm, {SPEC_PML_LAYERS} layers",
+        fontsize=12, fontweight="bold", y=1.02,
+    )
+    _any_pos = False
+    for _n in range(N_SPEC_RINGS):
+        if _n not in _spec_results: continue
+        _pm = _spec_results[_n]
+        _rv = _pm["radii_um"][_pm["valid_mask"]]
+        _av = _pm["alpha_bend_arr"][_pm["valid_mask"]]
+        _ok = np.isfinite(_av) & (_av > 0)
+        if np.any(_ok):
+            _any_pos = True
+            axb0.semilogy(_rv[_ok], _av[_ok], color=_colors[_n], lw=1.3, alpha=0.85)
+        if np.isfinite(_pm["alpha_bend_match_dbcm"]) and _pm["alpha_bend_match_dbcm"] > 0:
+            axb0.scatter([_pm["R_pm_um"]], [_pm["alpha_bend_match_dbcm"]],
+                         s=45, color=_colors[_n], edgecolors="k", lw=0.5, zorder=5)
+    axb0.axhline(SPEC_ALPHA_PROP_DBCM, color="#E69F00", ls="--", lw=1.6,
+                 label=f"assumed $\\alpha_\\mathrm{{prop}}$ = {SPEC_ALPHA_PROP_DBCM:.1f} dB/cm")
+    axb0.set_xlabel("Bend radius  R  (µm)")
+    axb0.set_ylabel(r"$\alpha_\mathrm{bend}$  (dB/cm, log scale)")
+    axb0.set_title(r"Bend loss vs Radius  (dots = $R_\mathrm{pm}$)")
+    axb0.legend()
+    axb0.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+    if not _any_pos:
+        axb0.text(0.5, 0.5, "no positive alpha_bend yet\n(enable PML / check warnings)",
+                  transform=axb0.transAxes, ha="center", va="center", fontsize=9)
+    _lam_b = [_spec_results[_n]["lam_nm"]
+              for _n in range(N_SPEC_RINGS) if _n in _spec_results]
+    _ab_b  = [_spec_results[_n]["alpha_bend_match_dbcm"]
+              for _n in range(N_SPEC_RINGS) if _n in _spec_results]
+    axb1.plot(_lam_b, _ab_b, "^-", color="#9467BD", lw=2.0, ms=7,
+              label=r"$\alpha_\mathrm{bend}$ at $R_\mathrm{pm}$")
+    axb1.axhline(SPEC_ALPHA_PROP_DBCM, color="#E69F00", ls="--", lw=1.6,
+                 label=f"assumed $\\alpha_\\mathrm{{prop}}$ = {SPEC_ALPHA_PROP_DBCM:.1f} dB/cm")
+    axb1.set_xlabel(r"Ring resonance wavelength  $\lambda_n$  (nm)")
+    axb1.set_ylabel(r"$\alpha_\mathrm{bend}$  (dB/cm)")
+    axb1.set_title(r"Bend loss at the phase-matched radius vs $\lambda_n$")
+    axb1.legend()
+    axb1.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+    axb1.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+    plt.tight_layout()
+    _fig5_stem = DATA_DIR / f"{VERSION_NAME_SIO2}_spectrometer_bendloss"
+    for _ext in (".png", ".pdf"):
+        plt.savefig(str(_fig5_stem) + _ext, dpi=150, bbox_inches="tight")
+        print(f"  Saved → {str(_fig5_stem) + _ext}")
+    plt.close('all')
 
     state.update({k: globals().get(k) for k in [
-        'N_SPEC_RINGS', 'SPEC_DELTA_LAM_NG_NM', 'SPEC_DELTA_LAM_NM', 'SPEC_FSR_NM', 'SPEC_LAM0_NM', 'SPEC_LAM_NM',
-        'SPEC_N_RADII', 'SPEC_N_UPPER', 'SPEC_R_HALF_SPAN_UM', 'SPEC_R_MIN_FLOOR_UM', 'SPEC_WG_WIDTH_NM', '_H1',
-        '_H2', '_H3', '_L_m', '_N_n', '_PM_MAX_ITER', '_PM_TOL_M',
-        '_R_est_um', '_R_m', '_R_um', '_SEP', '_SEP2', '_any_uncached',
-        '_bi_local', '_cbar', '_cmap', '_cnorm', '_colors', '_comp_n',
-        '_delta', '_dlam_ng_m', '_dneff_dlam_str', '_dng', '_el', '_elapsed',
-        '_eta', '_ext', '_fig_stem', '_fsr_all', '_fsr_m', '_glv',
-        '_gp', '_grp_paths', '_gv', '_hdr', '_i', '_lam0_n_m',
-        '_lam0_n_nm', '_lam_m_arr', '_lam_nm_arr', '_lam_v', '_n', '_n_cached',
-        '_neff_n', '_neff_str', '_neff_str_fit', '_neff_v', '_ngL_m', '_ngL_m_i',
-        '_ngL_n', '_ng_all', '_ng_n', '_ng_str', '_ng_v', '_nhi_n',
-        '_nhi_v', '_nlo_n', '_nlo_v', '_nv', '_pm', '_poly_str',
-        '_r_all', '_radii_um_n', '_rate', '_remaining', '_rfsr_v', '_rg',
-        '_rmax', '_rmin', '_rpm_v', '_runs', '_rv', '_sm',
-        '_sp_core_t_um', '_sp_half_t_um', '_sp_hf', '_sp_mode', '_sp_sio2_z_ctr', '_sp_sio2_z_span',
-        '_sp_wg_w_m', '_sp_y_span_um', '_sp_z_above_um', '_sp_z_below_um', '_sp_z_ctr', '_sp_z_span_um',
-        '_spec_r_max', '_spec_r_min', '_spec_radii_um', '_spec_results', '_spec_w_idx', '_spec_w_nm',
-        '_spec_w_um', '_t0', '_target_ngL_n_m', '_target_ngL_n_um', '_te', '_te_n',
-        '_te_str', '_te_v', '_tgt', '_valid_idx', '_valid_n', '_valid_str',
-        '_vn', '_wl_str_m', 'ax00', 'ax01', 'ax10', 'ax11',
-        'axes', 'fig', 'spec_FSR_pm_nm', 'spec_L_pm_um', 'spec_R_pm_um', 'spec_lam_res_pm_nm',
-        'spec_m', 'spec_neff_pm', 'spec_ng_pm',
+        'N_SPEC_RINGS', 'SPEC_ALPHA_PROP_DBCM', 'SPEC_DELTA_LAM_NG_NM', 'SPEC_DELTA_LAM_NM', 'SPEC_FSR_NM', 'SPEC_FWHM_NM',
+        'SPEC_LAM0_NM', 'SPEC_LAM_NM', 'SPEC_LOSS_TRIAL_MODES', 'SPEC_MESH_DY_NM', 'SPEC_N_RADII', 'SPEC_N_UPPER',
+        'SPEC_PML_LAYERS', 'SPEC_R_HALF_SPAN_UM', 'SPEC_R_MIN_FLOOR_UM', 'SPEC_USE_PML_FOR_LOSS', 'SPEC_WG_WIDTH_NM', 'SPEC_Y_SPAN_LOSS_UM',
+        '_H1', '_H2', '_H3', '_H4', '_L_m', '_N_n',
+        '_PM_MAX_ITER', '_PM_TOL_M', '_R_est_um', '_R_m', '_R_um', '_SEP',
+        '_SEP2', '_SP_DBCM_PER_INVM', '_a_bend_match', '_a_bend_per_m', '_a_dbcm', '_a_tot_dbcm',
+        '_ab_all', '_ab_b', '_ab_fin', '_abend_n', '_any_pos', '_any_uncached',
+        '_av', '_c', '_cbar', '_cmap', '_cnorm', '_colors',
+        '_comp_n', '_delta', '_dlam_ng_m', '_dneff_dlam_str', '_dng', '_done_n',
+        '_el', '_elapsed', '_eta', '_ext', '_fig5_stem', '_fig_stem',
+        '_fsr_all', '_fsr_m', '_fsr_was_cached', '_glv', '_gp', '_grp_paths',
+        '_gv', '_hdr', '_i', '_l', '_lam0_n_m', '_lam0_n_nm',
+        '_lam_b', '_lam_m_arr', '_lam_nm_arr', '_lam_v', '_loss_dbm', '_loss_n',
+        '_lossdbm_n', '_match_full_idx', '_n', '_n_done', '_n_fsr_only', '_neff_n',
+        '_neff_str', '_neff_str_fit', '_neff_v', '_ngL_m', '_ngL_m_i', '_ngL_n',
+        '_ng_all', '_ng_n', '_ng_str', '_ng_v', '_nhi_n', '_nhi_v',
+        '_nimag', '_nimag_n', '_nlo_n', '_nlo_v', '_nv', '_ok',
+        '_pm', '_poly_str', '_r_all', '_radii_um_n', '_rate', '_ratio',
+        '_remaining', '_rfsr_v', '_rg', '_rmax', '_rmin', '_rpm_v',
+        '_runs', '_rv', '_sm', '_sp_core_t_um', '_sp_half_t_um', '_sp_hf',
+        '_sp_mesh_y_loss', '_sp_mode', '_sp_sio2_z_ctr', '_sp_sio2_z_span', '_sp_wg_w_m', '_sp_y_span_loss_um',
+        '_sp_y_span_um', '_sp_z_above_um', '_sp_z_below_um', '_sp_z_ctr', '_sp_z_span_um', '_spec_r_max',
+        '_spec_r_min', '_spec_radii_um', '_spec_results', '_spec_w_idx', '_spec_w_nm', '_spec_w_um',
+        '_src', '_t0', '_target_ngL_n_m', '_target_ngL_n_um', '_te_n', '_te_str',
+        '_te_v', '_tgt', '_valid_n', '_valid_str', '_vn', '_wl_str_m',
+        'ax00', 'ax01', 'ax10', 'ax11', 'axb0', 'axb1',
+        'axes', 'fig', 'fig5', 'spec_FSR_pm_nm', 'spec_L_pm_um', 'spec_Q_bend',
+        'spec_Q_i_total', 'spec_R_pm_um', 'spec_alpha_bend_dbcm', 'spec_alpha_total_dbcm', 'spec_lam_res_pm_nm', 'spec_m',
+        'spec_neff_imag', 'spec_neff_pm', 'spec_ng_pm',
     ] if k in globals()})
     return state
 
