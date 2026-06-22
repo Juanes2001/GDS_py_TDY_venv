@@ -26,7 +26,6 @@ from . import plotting as _plot
 
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 _exc = None
-save_fig = None
 selected_width_nm = None
 
 apply_style()
@@ -40,10 +39,17 @@ RR_FSR_NM      = TARGET_FSR_NM    # [nm]  target free spectral range    (config)
 RR_LAM0_NM     = LAMBDA0_NM       # [nm]  resonance wavelength          (config)
 RR_WG_WIDTH_NM = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
                   else float(WG_WIDTH_FALLBACK_NM))   # provisional; resolved in run()
-RR_R_MIN_UM  = 18.0    # [µm]
-RR_R_MAX_UM  = 20.0   # [µm]
-RR_N_RADII   = 100
+RR_NG_GUESS    = N_SIN_FIXED   # group-index seed for the analytic radius
+RR_WINDOW_FRAC = 0.30          # half-width of the search window (fraction of R_seed)
+RR_N_RADII     = 100
+_RR_R_SEED_UM = ((RR_LAM0_NM * 1e-9) ** 2
+                 / (2.0 * np.pi * RR_NG_GUESS * (RR_FSR_NM * 1e-9))) * 1e6
+RR_R_MIN_UM = _RR_R_SEED_UM * (1.0 - RR_WINDOW_FRAC)    # [µm]
+RR_R_MAX_UM = _RR_R_SEED_UM * (1.0 + RR_WINDOW_FRAC)    # [µm]
 _RR_DELTA_LAM_NM = 5.0   # [nm]  half-span for central difference
+RR_TE_FRAC_MIN   = 0.5   # min TE polarization fraction to count a mode as "TE";
+RR_CORE_MESH_NM     = 10.0    # [nm]  target dy = dz inside the core override box
+RR_CORE_MESH_PAD_NM = 400.0   # [nm]  how far the fine box extends past the core (tails)
 RR_USE_PML_FOR_LOSS = True    # PML boundaries for the loss solve (False = loss-blind)
 RR_Y_SPAN_LOSS_UM   = 16.0    # [µm]  widened lateral span so the PML is past the caustic
 RR_MESH_DY_NM       = 50.0    # [nm]  target y cell size over the widened span
@@ -243,6 +249,20 @@ def _rr_build_fde(mode, radius_m: float, wavelength_m: float,
     m.set("material", "<Object defined dielectric>")
     m.set("index",    N_SIN_FIXED)
 
+    # Local fine-mesh box on the core (+ tails). Without this the high-contrast
+    # thin-core mode is under-resolved by the global mesh and the solver returns
+    # spurious modes with n_eff pinned near n_core. dy = dz = RR_CORE_MESH_NM.
+    _rr_core_mesh_m = RR_CORE_MESH_NM     * 1e-9
+    _rr_core_pad_m  = RR_CORE_MESH_PAD_NM * 1e-9
+    m.addmesh()
+    m.set("name",   "RR_core_mesh")
+    m.set("x",      0.0);  m.set("x span", 1.0e-6)
+    m.set("y",      0.0);  m.set("y span", _wg_w_m + 2.0 * _rr_core_pad_m)
+    m.set("z",      0.0);  m.set("z span", _core_t_um * 1e-6 + 2.0 * _rr_core_pad_m)
+    m.set("override x mesh", False)
+    m.set("override y mesh", True);  m.set("dy", _rr_core_mesh_m)
+    m.set("override z mesh", True);  m.set("dz", _rr_core_mesh_m)
+
 
 def _rr_collect_modes(mode, n_try: int):
     """
@@ -286,11 +306,22 @@ def _rr_solve_neff(mode, radius_m: float, wavelength_m: float,
             f"findmodes found no modes (R={radius_m*1e6:.3f} um, "
             f"lam={wavelength_m*1e9:.1f} nm, for_loss={for_loss})")
 
-    if for_loss and (neff_guess is not None):
-        _te_like = [mm for mm in found if mm[2] >= 0.5] or found
+    # Mode selection: always lock onto the fundamental TE0 mode.
+    #   - reject SPURIOUS modes first: a guided mode must satisfy
+    #         N_SIO2_FIXED < Re(neff) < N_SIN_FIXED
+    #     (n_eff can never reach the core index; anything >= N_SIN_FIXED is a
+    #     numerical artifact, the cause of the "n_eff >= n_core" rows);
+    #   - then keep TE-polarised modes (TE fraction >= RR_TE_FRAC_MIN);
+    #   - with a neff_guess (stencil continuity or loss solve), take the TE mode
+    #     whose Re(neff) is closest to the guess  -> same physical mode;
+    #   - without a guess, take the TE mode of HIGHEST Re(neff) = fundamental TE0.
+    _phys = [mm for mm in found if N_SIO2_FIXED < mm[1].real < N_SIN_FIXED]
+    _pool = _phys or found                                   # prefer physical modes
+    _te_like = [mm for mm in _pool if mm[2] >= RR_TE_FRAC_MIN] or _pool
+    if neff_guess is not None:
         sel = min(_te_like, key=lambda mm: abs(mm[1].real - neff_guess))
     else:
-        sel = found[0]                       # fundamental = mode1 (original)
+        sel = max(_te_like, key=lambda mm: mm[1].real)
     ksel, nc, te_v = sel
 
     loss_dbm = np.nan
@@ -305,10 +336,14 @@ def _rr_solve_neff(mode, radius_m: float, wavelength_m: float,
 
 def _rr_fsr_stencil(mode, radius_m: float):
     """Three LIGHT solves -> (neff_at_lam0, ng, te_frac, neff_lo, neff_hi).
-    Identical to the original FSR-matching computation (n_g unchanged)."""
-    neff_lo, _, _,    _ = _rr_solve_neff(mode, radius_m, _lam_lo_m, for_loss=False)
+    lam0 locks the fundamental TE0 (highest-neff TE mode); lam_lo and lam_hi are
+    anchored to that neff so all three solves track the SAME physical mode, which
+    is what makes the ng central difference physically meaningful."""
     neff_0,  _, te_v, _ = _rr_solve_neff(mode, radius_m, _lam0_m,   for_loss=False)
-    neff_hi, _, _,    _ = _rr_solve_neff(mode, radius_m, _lam_hi_m, for_loss=False)
+    neff_lo, _, _,    _ = _rr_solve_neff(mode, radius_m, _lam_lo_m, for_loss=False,
+                                         neff_guess=neff_0)
+    neff_hi, _, _,    _ = _rr_solve_neff(mode, radius_m, _lam_hi_m, for_loss=False,
+                                         neff_guess=neff_0)
     ng = neff_0 - _lam0_m * (neff_hi - neff_lo) / _dlam_m
     return neff_0, ng, te_v, neff_lo, neff_hi
 
@@ -324,7 +359,7 @@ def run(state=None):
     between steps (the notebook's old kernel globals + bridge).
     Returns the updated `state`."""
     state = {} if state is None else state
-    global FWHM_SENSOR_NM, FWHM_SPEC_NM, RR_ALPHA_PROP_DBCM, RR_FSR_NM, RR_LAM0_NM, RR_LOSS_TRIAL_MODES, RR_MESH_DY_NM, RR_N_RADII, RR_PML_LAYERS, RR_R_MAX_UM, RR_R_MIN_UM, RR_USE_PML_FOR_LOSS, RR_WG_WIDTH_NM, RR_Y_SPAN_LOSS_UM, _C_BEND, _C_BEST, _C_NEFF, _C_NG, _C_NGL, _C_TGT, _DBCM_PER_INVM, _FSR_m, _L_m, _N, _RR_DELTA_LAM_NM, _RR_GROUP_KEY, _RR_HDF5_GROUP, _R_m, _R_um, _R_v, _a_bend_per_m, _a_dbcm, _a_tot_dbcm, _abend_v, _alpha_bend_arr, _bi, _computed, _core_t_um, _delta, _dist, _dlam_m, _done, _elapsed, _elapsed_total, _eta, _fsr_was_cached, _group_existed, _half_t_um, _have_loss, _hdr, _hf, _i, _lam0_m, _lam_hi_m, _lam_lo_m, _loss_dbm, _loss_dbm_arr, _loss_done, _mesh_y_loss, _n_done, _n_fsr_only, _neff_arr, _neff_hi_arr, _neff_imag_arr, _neff_lo_arr, _neff_v, _ngL_arr, _ngL_m, _ngL_v, _ng_arr, _ng_v, _nhi, _nimag, _nimag_v, _nlo, _pos, _radii_m, _radii_um, _rate, _remaining, _rg, _rr_mode, _runs_done, _sim_y_span_um, _sim_z_above_um, _sim_z_below_um, _sim_z_ctr_um, _sim_z_span_um, _sio2_z_ctr_um, _sio2_z_span_um, _src, _suffix, _t0, _target_ngL_m, _target_ngL_um, _te_arr, _te_v, _valid, _wg_w_m, _y_span_loss_um, ax1, ax2, ax3, ax4, fig1, fig2, fig3, fig4, rr_FSR_pred_nm, rr_Q_i_total, rr_Q_loaded, rr_best_L_um, rr_best_Q_bend, rr_best_R_um, rr_best_alpha_bend_dbcm, rr_best_neff, rr_best_neff_imag, rr_best_ng, rr_best_ngL_um
+    global FWHM_SENSOR_NM, FWHM_SPEC_NM, RR_ALPHA_PROP_DBCM, RR_CORE_MESH_NM, RR_CORE_MESH_PAD_NM, RR_FSR_NM, RR_LAM0_NM, RR_LOSS_TRIAL_MODES, RR_MESH_DY_NM, RR_NG_GUESS, RR_N_RADII, RR_PML_LAYERS, RR_R_MAX_UM, RR_R_MIN_UM, RR_TE_FRAC_MIN, RR_USE_PML_FOR_LOSS, RR_WG_WIDTH_NM, RR_WINDOW_FRAC, RR_Y_SPAN_LOSS_UM, _C_BEND, _C_BEST, _C_NEFF, _C_NG, _C_NGL, _C_TGT, _DBCM_PER_INVM, _FSR_m, _L_m, _N, _RR_DELTA_LAM_NM, _RR_GROUP_KEY, _RR_HDF5_GROUP, _RR_R_SEED_UM, _R_m, _R_um, _R_v, _a_bend_per_m, _a_dbcm, _a_tot_dbcm, _abend_v, _alpha_bend_arr, _bi, _computed, _core_t_um, _delta, _dist, _dlam_m, _done, _elapsed, _elapsed_total, _eta, _fsr_was_cached, _group_existed, _half_t_um, _have_loss, _hdr, _hf, _i, _lam0_m, _lam_hi_m, _lam_lo_m, _loss_dbm, _loss_dbm_arr, _loss_done, _mesh_y_loss, _n_done, _n_fsr_only, _neff_arr, _neff_hi_arr, _neff_imag_arr, _neff_lo_arr, _neff_v, _ngL_arr, _ngL_m, _ngL_v, _ng_arr, _ng_v, _nhi, _nimag, _nimag_v, _nlo, _pos, _radii_m, _radii_um, _rate, _remaining, _rg, _rr_mode, _runs_done, _sim_y_span_um, _sim_z_above_um, _sim_z_below_um, _sim_z_ctr_um, _sim_z_span_um, _sio2_z_ctr_um, _sio2_z_span_um, _src, _suffix, _t0, _target_ngL_m, _target_ngL_um, _te_arr, _te_v, _valid, _wg_w_m, _y_span_loss_um, ax1, ax2, ax3, ax4, fig1, fig2, fig3, fig4, rr_FSR_pred_nm, rr_Q_i_total, rr_Q_loaded, rr_best_L_um, rr_best_Q_bend, rr_best_R_um, rr_best_alpha_bend_dbcm, rr_best_neff, rr_best_neff_imag, rr_best_ng, rr_best_ngL_um
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
@@ -356,14 +391,22 @@ def run(state=None):
     print(f"  n_lower_clad         : {N_SIO2_FIXED}  (N_SIO2_FIXED)")
     print(f"  n_upper_clad         : {N_UPPER_CLADDING}   (N_UPPER_CLADDING)")
     print(f"  Required ng·L        : {_target_ngL_um:.4f} µm")
+    print(f"  Analytic R_seed      : {_RR_R_SEED_UM:.3f} µm  "
+          f"(ng_guess = {RR_NG_GUESS:.3f})")
     print(f"  ng stencil           : ±{_RR_DELTA_LAM_NM:.1f} nm  "
           f"(3 light solves for n_g + 1 PML solve for loss, per radius)")
-    print(f"  Radius sweep         : {RR_R_MIN_UM:.1f} – {RR_R_MAX_UM:.1f} µm  ({_N} pts)")
+    print(f"  Radius sweep         : {RR_R_MIN_UM:.3f} – {RR_R_MAX_UM:.3f} µm  "
+          f"(±{RR_WINDOW_FRAC*100:.0f}% around R_seed, {_N} pts)")
+    print(f"  Core mesh override   : dy=dz={RR_CORE_MESH_NM:.0f} nm  "
+          f"(~{_core_t_um*1e3/RR_CORE_MESH_NM:.0f} cells across {_core_t_um*1e3:.0f} nm core, "
+          f"+{RR_CORE_MESH_PAD_NM:.0f} nm tails)")
+    print(f"  Guided-mode window   : {N_SIO2_FIXED:.4f} < n_eff < {N_SIN_FIXED:.4f}  "
+          f"(spurious modes rejected)")
     print(f"  Bend-loss solve      : PML={RR_USE_PML_FOR_LOSS}, "
           f"y span {_y_span_loss_um:.1f} µm, mesh_y {_mesh_y_loss}, "
           f"{RR_PML_LAYERS} PML layers, near-n seed, {RR_LOSS_TRIAL_MODES} trial modes")
     print(f"  HDF5 group           : {_RR_HDF5_GROUP}")
-    print(f"  HDF5 file            : {HDF5_PATH}")
+    print(f"  HDF5 file            : {HDF5_PATH_RING_RADIUS}")
     print("=" * 65)
     _neff_arr       = np.full(_N, np.nan)
     _ng_arr         = np.full(_N, np.nan)
@@ -376,7 +419,7 @@ def run(state=None):
     _loss_dbm_arr   = np.full(_N, np.nan)   # NEW [dB/m]
     _computed       = np.zeros(_N, dtype=bool)   # FSR done
     _loss_done      = np.zeros(_N, dtype=bool)   # bend-loss attempted
-    _hf = h5py.File(HDF5_PATH, "a")   # 'a' = read/write, create if missing
+    _hf = h5py.File(HDF5_PATH_RING_RADIUS, "a")   # own file, read/write, create if missing
     _group_existed = _RR_HDF5_GROUP in _hf
     _rr_init_hdf5(_hf)                # create group and/or add any missing datasets
     _hf.flush()
@@ -513,7 +556,7 @@ def run(state=None):
     _hf[_RR_HDF5_GROUP]["metadata"].attrs["runs_completed"] = int((_computed & _loss_done).sum())
     _hf.flush()
     _hf.close()
-    log.info(f"HDF5 closed  →  {HDF5_PATH}")
+    log.info(f"HDF5 closed  →  {HDF5_PATH_RING_RADIUS}")
     _valid = ~np.isnan(_ng_arr)
     if not np.any(_valid):
         raise RuntimeError(
@@ -676,7 +719,7 @@ def run(state=None):
     fig4.tight_layout()
     save_fig(fig4, f"{VERSION_NAME}_ring_radius_bendloss")
     plt.close(fig4)
-    print(f"\n  Cached in : {HDF5_PATH}")
+    print(f"\n  Cached in : {HDF5_PATH_RING_RADIUS}")
     print(f"  HDF5 group: {_RR_HDF5_GROUP}")
     print(f"\n  Variables exported to the next cell:")
     print(f"    rr_best_R_um            = {rr_best_R_um:.4f}   # µm")
@@ -691,11 +734,12 @@ def run(state=None):
     print(f"    rr_Q_loaded             = {rr_Q_loaded:.3e}   # FWHM = {FWHM_SENSOR_NM} nm")
 
     state.update({k: globals().get(k) for k in [
-        'FWHM_SENSOR_NM', 'FWHM_SPEC_NM', 'RR_ALPHA_PROP_DBCM', 'RR_FSR_NM', 'RR_LAM0_NM', 'RR_LOSS_TRIAL_MODES',
-        'RR_MESH_DY_NM', 'RR_N_RADII', 'RR_PML_LAYERS', 'RR_R_MAX_UM', 'RR_R_MIN_UM', 'RR_USE_PML_FOR_LOSS',
-        'RR_WG_WIDTH_NM', 'RR_Y_SPAN_LOSS_UM', '_C_BEND', '_C_BEST', '_C_NEFF', '_C_NG',
-        '_C_NGL', '_C_TGT', '_DBCM_PER_INVM', '_FSR_m', '_L_m', '_N',
-        '_RR_DELTA_LAM_NM', '_RR_GROUP_KEY', '_RR_HDF5_GROUP', '_R_m', '_R_um', '_R_v',
+        'FWHM_SENSOR_NM', 'FWHM_SPEC_NM', 'RR_ALPHA_PROP_DBCM', 'RR_CORE_MESH_NM', 'RR_CORE_MESH_PAD_NM', 'RR_FSR_NM',
+        'RR_LAM0_NM', 'RR_LOSS_TRIAL_MODES', 'RR_MESH_DY_NM', 'RR_NG_GUESS', 'RR_N_RADII', 'RR_PML_LAYERS',
+        'RR_R_MAX_UM', 'RR_R_MIN_UM', 'RR_TE_FRAC_MIN', 'RR_USE_PML_FOR_LOSS', 'RR_WG_WIDTH_NM', 'RR_WINDOW_FRAC',
+        'RR_Y_SPAN_LOSS_UM', '_C_BEND', '_C_BEST', '_C_NEFF', '_C_NG', '_C_NGL',
+        '_C_TGT', '_DBCM_PER_INVM', '_FSR_m', '_L_m', '_N', '_RR_DELTA_LAM_NM',
+        '_RR_GROUP_KEY', '_RR_HDF5_GROUP', '_RR_R_SEED_UM', '_R_m', '_R_um', '_R_v',
         '_a_bend_per_m', '_a_dbcm', '_a_tot_dbcm', '_abend_v', '_alpha_bend_arr', '_bi',
         '_computed', '_core_t_um', '_delta', '_dist', '_dlam_m', '_done',
         '_elapsed', '_elapsed_total', '_eta', '_fsr_was_cached', '_group_existed', '_half_t_um',

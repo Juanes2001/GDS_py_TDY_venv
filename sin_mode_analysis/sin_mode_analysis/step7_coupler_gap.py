@@ -43,6 +43,7 @@ cc_lam_res_nm = None
 i = None
 j = None
 n = None
+rr_best_neff = None
 selected_width_nm = None
 
 apply_style()
@@ -52,9 +53,13 @@ apply_style()
 # ─────────────────────────────────────────────────────────
 _DC_N_RINGS    = 14         # 1 sensor (index 0) + 13 spectrometer (indices 1-13)
 _DC_N_SPEC     = 13         # spectrometer rings only
-DC_GAP_MIN_NM  = 150.0      # [nm]  minimum gap — fabrication lower bound
-DC_GAP_MAX_NM  = 450.0      # [nm]  maximum gap — evanescent overlap negligible
-DC_N_GAPS      = 100        # number of sweep points per coupler
+DC_GAP_FAB_MIN_NM = 100.0     # [nm]  fabrication lower bound (DRC floor) = window start
+DC_GAP_N_DECAY    = 6.0       # window width in coupling-decay lengths g0
+DC_GAP_MAX_CAP_NM = 1500.0    # [nm]  hard cap on the upper gap (bounds the FDE domain)
+DC_NEFF_FALLBACK  = None      # neff used ONLY if rr_best_neff is unavailable (standalone runs)
+DC_N_GAPS         = 100       # number of fine-sweep points inside the window
+DC_GAP_MIN_NM  = DC_GAP_FAB_MIN_NM
+DC_GAP_MAX_NM  = 800.0
 DC_LC_SELECTOR = "a"
 DC_N_MODES     = max(N_MODES_REQUEST, 6)
 _DC_WG_W_NM    = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
@@ -78,6 +83,22 @@ _DC_SIO2_Z_SPAN = _DC_Z_BELOW_UM            # 2.0 µm
 _DC_Z_CTR       = (_DC_Z_ABOVE_UM - _DC_Z_BELOW_UM) / 2.0            # 0.0 µm
 _dc_gaps_nm = np.linspace(DC_GAP_MIN_NM, DC_GAP_MAX_NM, DC_N_GAPS)
 _dc_gaps_m  = _dc_gaps_nm * 1e-9
+
+def _dc_gap_window_nm(neff, lam0_nm, n_lat, fab_min_nm, n_decay, cap_nm):
+    """
+    Analytic directional-coupler gap window from the lateral evanescent decay.
+        gamma = k0 * sqrt(neff^2 - n_lat^2)   [1/m]   (single-guide field decay)
+        g0    = 1 / gamma                      [m]    (coupling decay length)
+    Window = [fab_min, fab_min + n_decay * g0], capped at cap_nm.
+    Returns (gap_min_nm, gap_max_nm, g0_nm).
+    """
+    k0    = 2.0 * np.pi / (lam0_nm * 1e-9)
+    arg   = max(neff ** 2 - n_lat ** 2, 1e-6)          # guard weakly-guided case
+    gamma = k0 * np.sqrt(arg)                           # 1/m
+    g0_nm = (1.0 / gamma) * 1e9                         # nm
+    gmax  = min(fab_min_nm + n_decay * g0_nm, cap_nm)
+    return float(fab_min_nm), float(gmax), float(g0_nm)
+
 
 def _dc_build_fde(mode, gap_m: float, wavelength_m: float,
                   n_upper_clad: float) -> None:
@@ -338,7 +359,7 @@ def run(state=None):
     between steps (the notebook's old kernel globals + bridge).
     Returns the updated `state`."""
     state = {} if state is None else state
-    global DC_GAP_MAX_NM, DC_GAP_MIN_NM, DC_LC_SELECTOR, DC_MESH_Y, DC_MESH_Z, DC_N_GAPS, DC_N_MODES, DC_Y_SPAN_UM, _C_IN, _C_OUT, _DC_CORE_T_UM, _DC_HALF_T_UM, _DC_MARGIN_UM, _DC_MESH_STEP_UM, _DC_N_RINGS, _DC_N_SPEC, _DC_SIM_Y_SPAN_ORIG_UM, _DC_SIO2_Z_CTR, _DC_SIO2_Z_SPAN, _DC_WG_W_M, _DC_WG_W_NM, _DC_WG_W_UM, _DC_Z_ABOVE_UM, _DC_Z_BELOW_UM, _DC_Z_CTR, _DC_Z_SPAN_UM, _HDR, _Lc_a, _Lc_b, _Lc_sel, _S, _S2, _any_uncached, _ax, _c, _comp_arr, _ctype, _dc_gaps_m, _dc_gaps_nm, _dc_jobs, _dc_mode, _dn, _dn_a, _dn_arr, _dn_b, _dn_sel, _el, _eta, _ext, _f1, _f2, _gap_in, _gap_m, _gap_out, _gi, _grp, _hdf5_path, _hdr, _hf, _hf_init, _hf_r, _hpath, _in_j, _in_jobs, _inj, _is_sensor, _j, _ji, _job, _job_n_done, _k1_ach, _k1_tgt, _k2_ach, _k2_tgt, _k_tgt, _label, _lam_m, _lam_nm, _m, _n_done, _n_fully_cached, _n_oor, _n_up, _ne, _ne_arr, _no, _no_arr, _ok, _ouj, _out_j, _out_jobs, _plt_lbl, _plt_s, _rate, _remain, _rg, _ri, _ri_arr, _runs, _t0, _tee, _tee_arr, _teo, _teo_arr, _vi, _vn, _vo, ax2a, ax2b, axes1, dc_dn_input_sim, dc_dn_output_sim, dc_err_input_pct, dc_err_output_pct, dc_gap_input_nm, dc_gap_output_nm, dc_k1_achieved, dc_k2_achieved, fig1, fig2
+    global DC_GAP_FAB_MIN_NM, DC_GAP_MAX_CAP_NM, DC_GAP_MAX_NM, DC_GAP_MIN_NM, DC_GAP_N_DECAY, DC_LC_SELECTOR, DC_MESH_Y, DC_MESH_Z, DC_NEFF_FALLBACK, DC_N_GAPS, DC_N_MODES, DC_Y_SPAN_UM, _C_IN, _C_OUT, _DC_CORE_T_UM, _DC_HALF_T_UM, _DC_MARGIN_UM, _DC_MESH_STEP_UM, _DC_N_RINGS, _DC_N_SPEC, _DC_SIM_Y_SPAN_ORIG_UM, _DC_SIO2_Z_CTR, _DC_SIO2_Z_SPAN, _DC_WG_W_M, _DC_WG_W_NM, _DC_WG_W_UM, _DC_Z_ABOVE_UM, _DC_Z_BELOW_UM, _DC_Z_CTR, _DC_Z_SPAN_UM, _HDR, _Lc_a, _Lc_b, _Lc_sel, _S, _S2, _any_uncached, _ax, _c, _comp_arr, _ctype, _dc_g0_nm, _dc_gaps_m, _dc_gaps_nm, _dc_jobs, _dc_mode, _dc_neff_seed, _dn, _dn_a, _dn_arr, _dn_b, _dn_sel, _el, _eta, _ext, _f1, _f2, _gap_in, _gap_m, _gap_out, _gi, _grp, _hdf5_path, _hdr, _hf, _hf_init, _hf_r, _hpath, _in_j, _in_jobs, _inj, _is_sensor, _j, _ji, _job, _job_n_done, _k1_ach, _k1_tgt, _k2_ach, _k2_tgt, _k_tgt, _label, _lam_m, _lam_nm, _m, _n_done, _n_fully_cached, _n_oor, _n_up, _ne, _ne_arr, _no, _no_arr, _ok, _ouj, _out_j, _out_jobs, _plt_lbl, _plt_s, _rate, _remain, _rg, _ri, _ri_arr, _runs, _t0, _tee, _tee_arr, _teo, _teo_arr, _vi, _vn, _vo, ax2a, ax2b, axes1, dc_dn_input_sim, dc_dn_output_sim, dc_err_input_pct, dc_err_output_pct, dc_gap_input_nm, dc_gap_output_nm, dc_k1_achieved, dc_k2_achieved, fig1, fig2
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
@@ -352,21 +373,32 @@ def run(state=None):
                     f"WG_WIDTH_OVERRIDE_NM; using fallback {_DC_WG_W_NM:.0f} nm.")
     _DC_WG_W_UM  = _DC_WG_W_NM * 1e-3
     _DC_WG_W_M   = _DC_WG_W_NM * 1e-9
+    _dc_neff_seed = (float(rr_best_neff) if rr_best_neff is not None
+                     else float(DC_NEFF_FALLBACK) if DC_NEFF_FALLBACK is not None
+                     else 0.5 * (N_SIN_FIXED + N_SIO2_FIXED))
+    DC_GAP_MIN_NM, DC_GAP_MAX_NM, _dc_g0_nm = _dc_gap_window_nm(
+        _dc_neff_seed, LAMBDA0_NM, N_SIO2_FIXED,
+        DC_GAP_FAB_MIN_NM, DC_GAP_N_DECAY, DC_GAP_MAX_CAP_NM)
+    _dc_gaps_nm = np.linspace(DC_GAP_MIN_NM, DC_GAP_MAX_NM, DC_N_GAPS)
+    _dc_gaps_m  = _dc_gaps_nm * 1e-9
     DC_Y_SPAN_UM = 2.0 * _DC_MARGIN_UM + 2.0 * _DC_WG_W_UM + DC_GAP_MAX_NM * 1e-3
+    DC_MESH_Y    = int(np.ceil(DC_Y_SPAN_UM / _DC_MESH_STEP_UM))
     log.info(f"step7 single-mode working width = {_DC_WG_W_NM:.1f} nm "
              f"(override={WG_WIDTH_OVERRIDE_NM}, selected={selected_width_nm})")
     print("=" * 70)
     print("  DIRECTIONAL COUPLER GAP SWEEP — All 14 rings, input + output")
     print("=" * 70)
-    print(f"  Gap range       : {DC_GAP_MIN_NM:.0f} – {DC_GAP_MAX_NM:.0f} nm  ({DC_N_GAPS} pts)")
+    print(f"  Coupling decay  : g0 = {_dc_g0_nm:.1f} nm  "
+          f"(neff_seed = {_dc_neff_seed:.4f}, n_lat = {N_SIO2_FIXED:.4f})")
+    print(f"  Gap window      : {DC_GAP_MIN_NM:.0f} – {DC_GAP_MAX_NM:.0f} nm  "
+          f"(fab_min + {DC_GAP_N_DECAY:.0f}·g0, capped {DC_GAP_MAX_CAP_NM:.0f} nm, {DC_N_GAPS} pts)")
     print(f"  Lc selector     : '{DC_LC_SELECTOR}'"
           f"  (Lc = R_pm × {FRAC_A if DC_LC_SELECTOR=='a' else FRAC_B:.4f})")
     print(f"  Total couplers  : {2 * _DC_N_RINGS}  ({_DC_N_RINGS} rings × 2)")
     print(f"  FDE domain Y    : {DC_Y_SPAN_UM:.1f} µm  ({DC_MESH_Y} cells)"
           f"  Z: {_DC_Z_SPAN_UM:.1f} µm  ({DC_MESH_Z} cells)")
     print(f"  Max solves      : {2 * _DC_N_RINGS * DC_N_GAPS} (if nothing cached)")
-    print(f"  HDF5 files      : {HDF5_PATH.name} (sensor)")
-    print(f"                    {HDF5_PATH_SIO2.name} (spectrometer)")
+    print(f"  HDF5 file       : {HDF5_PATH_COUPLER.name}")
     print("=" * 70)
     print()
     _dc_jobs = []
@@ -374,7 +406,7 @@ def run(state=None):
         # Ring 0 = sensor (aqueous), rings 1-13 = spectrometer (SiO₂)
         _is_sensor  = (_ri == 0)
         _n_up       = N_UPPER_CLADDING     if _is_sensor else N_UPPER_CLADDING_SIO2
-        _hdf5_path  = HDF5_PATH            if _is_sensor else HDF5_PATH_SIO2
+        _hdf5_path  = HDF5_PATH_COUPLER    # one coupler-gap file; groups keyed by ring label
         _lam_nm     = float(cc_lam_res_nm[_ri])
         _label      = cc_labels[_ri]
         _Lc_a       = float(cc_Lc_a_um[_ri])
@@ -412,7 +444,7 @@ def run(state=None):
         f"Job list: {len(_dc_jobs)} coupler sweeps  "
         f"({DC_N_GAPS} gaps each  →  max {len(_dc_jobs)*DC_N_GAPS} FDE solves if uncached)"
     )
-    for _hpath in [HDF5_PATH, HDF5_PATH_SIO2]:
+    for _hpath in [HDF5_PATH_COUPLER]:
         with h5py.File(_hpath, "a") as _hf_init:
             for _job in _dc_jobs:
                 if _job["hdf5_path"] == _hpath:
@@ -740,13 +772,14 @@ def run(state=None):
     print("  Next step → CELL 13: FDTD/varFDTD validation using these gap values.")
 
     state.update({k: globals().get(k) for k in [
-        'DC_GAP_MAX_NM', 'DC_GAP_MIN_NM', 'DC_LC_SELECTOR', 'DC_MESH_Y', 'DC_MESH_Z', 'DC_N_GAPS',
-        'DC_N_MODES', 'DC_Y_SPAN_UM', '_C_IN', '_C_OUT', '_DC_CORE_T_UM', '_DC_HALF_T_UM',
-        '_DC_MARGIN_UM', '_DC_MESH_STEP_UM', '_DC_N_RINGS', '_DC_N_SPEC', '_DC_SIM_Y_SPAN_ORIG_UM', '_DC_SIO2_Z_CTR',
-        '_DC_SIO2_Z_SPAN', '_DC_WG_W_M', '_DC_WG_W_NM', '_DC_WG_W_UM', '_DC_Z_ABOVE_UM', '_DC_Z_BELOW_UM',
-        '_DC_Z_CTR', '_DC_Z_SPAN_UM', '_HDR', '_Lc_a', '_Lc_b', '_Lc_sel',
-        '_S', '_S2', '_any_uncached', '_ax', '_c', '_comp_arr',
-        '_ctype', '_dc_gaps_m', '_dc_gaps_nm', '_dc_jobs', '_dc_mode', '_dn',
+        'DC_GAP_FAB_MIN_NM', 'DC_GAP_MAX_CAP_NM', 'DC_GAP_MAX_NM', 'DC_GAP_MIN_NM', 'DC_GAP_N_DECAY', 'DC_LC_SELECTOR',
+        'DC_MESH_Y', 'DC_MESH_Z', 'DC_NEFF_FALLBACK', 'DC_N_GAPS', 'DC_N_MODES', 'DC_Y_SPAN_UM',
+        '_C_IN', '_C_OUT', '_DC_CORE_T_UM', '_DC_HALF_T_UM', '_DC_MARGIN_UM', '_DC_MESH_STEP_UM',
+        '_DC_N_RINGS', '_DC_N_SPEC', '_DC_SIM_Y_SPAN_ORIG_UM', '_DC_SIO2_Z_CTR', '_DC_SIO2_Z_SPAN', '_DC_WG_W_M',
+        '_DC_WG_W_NM', '_DC_WG_W_UM', '_DC_Z_ABOVE_UM', '_DC_Z_BELOW_UM', '_DC_Z_CTR', '_DC_Z_SPAN_UM',
+        '_HDR', '_Lc_a', '_Lc_b', '_Lc_sel', '_S', '_S2',
+        '_any_uncached', '_ax', '_c', '_comp_arr', '_ctype', '_dc_g0_nm',
+        '_dc_gaps_m', '_dc_gaps_nm', '_dc_jobs', '_dc_mode', '_dc_neff_seed', '_dn',
         '_dn_a', '_dn_arr', '_dn_b', '_dn_sel', '_el', '_eta',
         '_ext', '_f1', '_f2', '_gap_in', '_gap_m', '_gap_out',
         '_gi', '_grp', '_hdf5_path', '_hdr', '_hf', '_hf_init',

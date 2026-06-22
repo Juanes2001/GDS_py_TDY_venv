@@ -29,6 +29,7 @@ from . import plotting as _plot
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 _exc = None
 _l = None
+rr_best_R_um = None
 selected_width_nm = None
 
 apply_style()
@@ -36,7 +37,12 @@ apply_style()
 # ─────────────────────────────────────────────────────────
 #  Module constants / design knobs for this step
 # ─────────────────────────────────────────────────────────
-AIS_BEND_RADIUS_UM   = 19.0021        # [µm]  ← change this per experiment
+AIS_BEND_RADIUS_OVERRIDE_UM = None    # [µm]  None = use step3 sensor radius; or a value
+_ais_R_seed_um = ((LAMBDA0_NM * 1e-9) ** 2
+                  / (2.0 * np.pi * N_SIN_FIXED * (TARGET_FSR_NM * 1e-9))) * 1e6
+AIS_BEND_RADIUS_UM   = (float(AIS_BEND_RADIUS_OVERRIDE_UM)
+                        if AIS_BEND_RADIUS_OVERRIDE_UM is not None
+                        else _ais_R_seed_um)        # provisional; resolved in run()
 AIS_N_AQ_START       = 1.3300      # lower bound  (pure water @ 1550 nm)
 AIS_N_AQ_END         = 1.3700      # upper bound  (moderately contaminated water)
 AIS_N_POINTS         = 200         # number of sweep points
@@ -44,7 +50,7 @@ AIS_LAM0_NM          = LAMBDA0_NM  # [nm]  centre wavelength            (config)
 AIS_DELTA_LAM_NM     = 5.0         # [nm]  half-span for central-difference ng
 AIS_WG_WIDTH_NM      = (float(WG_WIDTH_OVERRIDE_NM) if WG_WIDTH_OVERRIDE_NM is not None
                         else float(WG_WIDTH_FALLBACK_NM))   # provisional; resolved in run()
-AIS_WG_HEIGHT_NM     = 400.0       # [nm]  core height — THICKNESS, along Z
+AIS_WG_HEIGHT_NM     = CORE_THICKNESS_UM * 1e3   # [nm]  core height = config thickness
 AIS_HIDE_GUI         = False       # True for headless / HPC runs
 AIS_CSV_NAME         = f"AIS_R{AIS_BEND_RADIUS_UM:.2f}um_naq_sweep_{AIS_N_POINTS}pts"
 _ais_lam0_m   = AIS_LAM0_NM   * 1e-9
@@ -287,7 +293,7 @@ def run(state=None):
     between steps (the notebook's old kernel globals + bridge).
     Returns the updated `state`."""
     state = {} if state is None else state
-    global AIS_BEND_RADIUS_UM, AIS_CSV_NAME, AIS_DELTA_LAM_NM, AIS_HIDE_GUI, AIS_LAM0_NM, AIS_N_AQ_END, AIS_N_AQ_START, AIS_N_POINTS, AIS_WG_HEIGHT_NM, AIS_WG_WIDTH_NM, _AIS_GROUP_KEY, _AIS_HDF5_GROUP, _C_NEFF, _C_NG, _C_SENS, _C_TE, _SEP, _S_lam_mean, _S_neff_mean, _S_ng_mean, _ais_N, _ais_R_m, _ais_computed, _ais_core_t_um, _ais_csv_path, _ais_dlam_m, _ais_elapsed_total, _ais_half_t_um, _ais_hf, _ais_lam0_m, _ais_lam_hi_m, _ais_lam_lo_m, _ais_mesh_step_um, _ais_mesh_y, _ais_mesh_z, _ais_mode, _ais_n_aq_arr, _ais_n_cached, _ais_neff_arr, _ais_neff_hi_arr, _ais_neff_lo_arr, _ais_ng_arr, _ais_remaining, _ais_rg, _ais_runs_done, _ais_sio2_z_ctr, _ais_sio2_z_span, _ais_t0, _ais_te_arr, _ais_valid, _ais_wg_h_m, _ais_wg_w_m, _ais_y_margin_um, _ais_y_span_um, _ais_z_above_um, _ais_z_below_um, _ais_z_ctr, _ais_z_span_um, _ax00_ann, _ax01_ann, _elapsed, _eta, _ext, _fig1_stem, _fig2_stem, _hdr, _i, _labels, _lines, _ln_neff, _ln_ng, _n_aq, _neff_v, _ng_v, _nhi_v, _nlo_v, _rate, _te_v, _v_S_lam_pm_riu, _v_S_neff, _v_S_ng, _v_n_aq, _v_neff, _v_ng, _v_te, _Δn_aq, _Δneff, _Δng, ais_S_lam_pm_RIU, ais_S_neff, ais_S_ng, ais_n_aq_valid, ais_neff, ais_ng, ais_results_df, ais_te_frac, ax00, ax01, ax10, ax11, ax_neff, ax_ng, axes1, fig1, fig2
+    global AIS_BEND_RADIUS_OVERRIDE_UM, AIS_BEND_RADIUS_UM, AIS_CSV_NAME, AIS_DELTA_LAM_NM, AIS_HIDE_GUI, AIS_LAM0_NM, AIS_N_AQ_END, AIS_N_AQ_START, AIS_N_POINTS, AIS_WG_HEIGHT_NM, AIS_WG_WIDTH_NM, _AIS_GROUP_KEY, _AIS_HDF5_GROUP, _C_NEFF, _C_NG, _C_SENS, _C_TE, _SEP, _S_lam_mean, _S_neff_mean, _S_ng_mean, _ais_N, _ais_R_m, _ais_R_seed_um, _ais_computed, _ais_core_t_um, _ais_csv_path, _ais_dlam_m, _ais_elapsed_total, _ais_half_t_um, _ais_hf, _ais_lam0_m, _ais_lam_hi_m, _ais_lam_lo_m, _ais_mesh_step_um, _ais_mesh_y, _ais_mesh_z, _ais_mode, _ais_n_aq_arr, _ais_n_cached, _ais_neff_arr, _ais_neff_hi_arr, _ais_neff_lo_arr, _ais_ng_arr, _ais_remaining, _ais_rg, _ais_runs_done, _ais_sio2_z_ctr, _ais_sio2_z_span, _ais_t0, _ais_te_arr, _ais_valid, _ais_wg_h_m, _ais_wg_w_m, _ais_y_margin_um, _ais_y_span_um, _ais_z_above_um, _ais_z_below_um, _ais_z_ctr, _ais_z_span_um, _ax00_ann, _ax01_ann, _elapsed, _eta, _ext, _fig1_stem, _fig2_stem, _hdr, _i, _labels, _lines, _ln_neff, _ln_ng, _n_aq, _neff_v, _ng_v, _nhi_v, _nlo_v, _rate, _te_v, _v_S_lam_pm_riu, _v_S_neff, _v_S_ng, _v_n_aq, _v_neff, _v_ng, _v_te, _Δn_aq, _Δneff, _Δng, ais_S_lam_pm_RIU, ais_S_neff, ais_S_ng, ais_n_aq_valid, ais_neff, ais_ng, ais_results_df, ais_te_frac, ax00, ax01, ax10, ax11, ax_neff, ax_ng, axes1, fig1, fig2
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
@@ -299,6 +305,10 @@ def run(state=None):
         AIS_WG_WIDTH_NM = float(WG_WIDTH_FALLBACK_NM)
         log.warning("step9: no single-mode width from the modal step and no "
                     f"WG_WIDTH_OVERRIDE_NM; using fallback {AIS_WG_WIDTH_NM:.0f} nm.")
+    if AIS_BEND_RADIUS_OVERRIDE_UM is None and rr_best_R_um is not None:
+        AIS_BEND_RADIUS_UM = float(rr_best_R_um)
+    _ais_R_m     = AIS_BEND_RADIUS_UM * 1e-6
+    AIS_CSV_NAME = f"AIS_R{AIS_BEND_RADIUS_UM:.2f}um_naq_sweep_{AIS_N_POINTS}pts"
     _ais_wg_w_m    = AIS_WG_WIDTH_NM * 1e-9
     _ais_y_span_um = AIS_WG_WIDTH_NM * 1e-3 + 2.0 * _ais_y_margin_um
     _ais_mesh_y    = int(np.ceil(_ais_y_span_um / _ais_mesh_step_um))
@@ -326,7 +336,7 @@ def run(state=None):
           f"z = {_ais_z_span_um:.2f} µm ({_ais_mesh_z} cells)")
     print(f"  Total FDE runs  : {_ais_N} × 3 = {_ais_N * 3}  (if uncached)")
     print(f"  HDF5 group      : {_AIS_HDF5_GROUP}")
-    print(f"  HDF5 file       : {HDF5_PATH}")
+    print(f"  HDF5 file       : {HDF5_PATH_AQUEOUS_SWEEP}")
     print(f"  CSV output      : {DATA_DIR / AIS_CSV_NAME}.csv")
     print("=" * 68)
     _ais_neff_arr    = np.full(_ais_N, np.nan, dtype=np.float64)
@@ -335,7 +345,7 @@ def run(state=None):
     _ais_neff_lo_arr = np.full(_ais_N, np.nan, dtype=np.float64)
     _ais_neff_hi_arr = np.full(_ais_N, np.nan, dtype=np.float64)
     _ais_computed    = np.zeros(_ais_N, dtype=bool)
-    _ais_hf = h5py.File(HDF5_PATH, "a")   # 'a' = read/write, create if absent
+    _ais_hf = h5py.File(HDF5_PATH_AQUEOUS_SWEEP, "a")   # 'a' = read/write, create if absent
     if _AIS_HDF5_GROUP in _ais_hf:
         log.info(f"AIS cache found → {_AIS_HDF5_GROUP}")
         (
@@ -441,7 +451,7 @@ def run(state=None):
         int(_ais_computed.sum())
     _ais_hf.flush()
     _ais_hf.close()
-    log.info(f"HDF5 closed → {HDF5_PATH}")
+    log.info(f"HDF5 closed → {HDF5_PATH_AQUEOUS_SWEEP}")
     _ais_valid = ~np.isnan(_ais_neff_arr)
     if not np.any(_ais_valid):
         raise RuntimeError(
@@ -647,27 +657,27 @@ def run(state=None):
     print(f"    ais_results_df     Pandas DataFrame ({len(ais_results_df)} rows × {len(ais_results_df.columns)} columns)")
     print(f"\n  CSV saved to : {_ais_csv_path}")
     print(f"  HDF5 group   : {_AIS_HDF5_GROUP}")
-    print(f"  HDF5 file    : {HDF5_PATH}")
+    print(f"  HDF5 file    : {HDF5_PATH_AQUEOUS_SWEEP}")
 
     state.update({k: globals().get(k) for k in [
-        'AIS_BEND_RADIUS_UM', 'AIS_CSV_NAME', 'AIS_DELTA_LAM_NM', 'AIS_HIDE_GUI', 'AIS_LAM0_NM', 'AIS_N_AQ_END',
-        'AIS_N_AQ_START', 'AIS_N_POINTS', 'AIS_WG_HEIGHT_NM', 'AIS_WG_WIDTH_NM', '_AIS_GROUP_KEY', '_AIS_HDF5_GROUP',
-        '_C_NEFF', '_C_NG', '_C_SENS', '_C_TE', '_SEP', '_S_lam_mean',
-        '_S_neff_mean', '_S_ng_mean', '_ais_N', '_ais_R_m', '_ais_computed', '_ais_core_t_um',
-        '_ais_csv_path', '_ais_dlam_m', '_ais_elapsed_total', '_ais_half_t_um', '_ais_hf', '_ais_lam0_m',
-        '_ais_lam_hi_m', '_ais_lam_lo_m', '_ais_mesh_step_um', '_ais_mesh_y', '_ais_mesh_z', '_ais_mode',
-        '_ais_n_aq_arr', '_ais_n_cached', '_ais_neff_arr', '_ais_neff_hi_arr', '_ais_neff_lo_arr', '_ais_ng_arr',
-        '_ais_remaining', '_ais_rg', '_ais_runs_done', '_ais_sio2_z_ctr', '_ais_sio2_z_span', '_ais_t0',
-        '_ais_te_arr', '_ais_valid', '_ais_wg_h_m', '_ais_wg_w_m', '_ais_y_margin_um', '_ais_y_span_um',
-        '_ais_z_above_um', '_ais_z_below_um', '_ais_z_ctr', '_ais_z_span_um', '_ax00_ann', '_ax01_ann',
-        '_elapsed', '_eta', '_ext', '_fig1_stem', '_fig2_stem', '_hdr',
-        '_i', '_labels', '_lines', '_ln_neff', '_ln_ng', '_n_aq',
-        '_neff_v', '_ng_v', '_nhi_v', '_nlo_v', '_rate', '_te_v',
-        '_v_S_lam_pm_riu', '_v_S_neff', '_v_S_ng', '_v_n_aq', '_v_neff', '_v_ng',
-        '_v_te', '_Δn_aq', '_Δneff', '_Δng', 'ais_S_lam_pm_RIU', 'ais_S_neff',
-        'ais_S_ng', 'ais_n_aq_valid', 'ais_neff', 'ais_ng', 'ais_results_df', 'ais_te_frac',
-        'ax00', 'ax01', 'ax10', 'ax11', 'ax_neff', 'ax_ng',
-        'axes1', 'fig1', 'fig2',
+        'AIS_BEND_RADIUS_OVERRIDE_UM', 'AIS_BEND_RADIUS_UM', 'AIS_CSV_NAME', 'AIS_DELTA_LAM_NM', 'AIS_HIDE_GUI', 'AIS_LAM0_NM',
+        'AIS_N_AQ_END', 'AIS_N_AQ_START', 'AIS_N_POINTS', 'AIS_WG_HEIGHT_NM', 'AIS_WG_WIDTH_NM', '_AIS_GROUP_KEY',
+        '_AIS_HDF5_GROUP', '_C_NEFF', '_C_NG', '_C_SENS', '_C_TE', '_SEP',
+        '_S_lam_mean', '_S_neff_mean', '_S_ng_mean', '_ais_N', '_ais_R_m', '_ais_R_seed_um',
+        '_ais_computed', '_ais_core_t_um', '_ais_csv_path', '_ais_dlam_m', '_ais_elapsed_total', '_ais_half_t_um',
+        '_ais_hf', '_ais_lam0_m', '_ais_lam_hi_m', '_ais_lam_lo_m', '_ais_mesh_step_um', '_ais_mesh_y',
+        '_ais_mesh_z', '_ais_mode', '_ais_n_aq_arr', '_ais_n_cached', '_ais_neff_arr', '_ais_neff_hi_arr',
+        '_ais_neff_lo_arr', '_ais_ng_arr', '_ais_remaining', '_ais_rg', '_ais_runs_done', '_ais_sio2_z_ctr',
+        '_ais_sio2_z_span', '_ais_t0', '_ais_te_arr', '_ais_valid', '_ais_wg_h_m', '_ais_wg_w_m',
+        '_ais_y_margin_um', '_ais_y_span_um', '_ais_z_above_um', '_ais_z_below_um', '_ais_z_ctr', '_ais_z_span_um',
+        '_ax00_ann', '_ax01_ann', '_elapsed', '_eta', '_ext', '_fig1_stem',
+        '_fig2_stem', '_hdr', '_i', '_labels', '_lines', '_ln_neff',
+        '_ln_ng', '_n_aq', '_neff_v', '_ng_v', '_nhi_v', '_nlo_v',
+        '_rate', '_te_v', '_v_S_lam_pm_riu', '_v_S_neff', '_v_S_ng', '_v_n_aq',
+        '_v_neff', '_v_ng', '_v_te', '_Δn_aq', '_Δneff', '_Δng',
+        'ais_S_lam_pm_RIU', 'ais_S_neff', 'ais_S_ng', 'ais_n_aq_valid', 'ais_neff', 'ais_ng',
+        'ais_results_df', 'ais_te_frac', 'ax00', 'ax01', 'ax10', 'ax11',
+        'ax_neff', 'ax_ng', 'axes1', 'fig1', 'fig2',
     ] if k in globals()})
     return state
 

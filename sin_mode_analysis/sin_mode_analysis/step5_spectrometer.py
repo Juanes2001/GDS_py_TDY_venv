@@ -49,9 +49,12 @@ SPEC_FSR_NM         = TARGET_FSR_NM             # target FSR                  (c
 SPEC_N_UPPER        = N_UPPER_CLADDING_SIO2     # 1.4469   — SiO₂ symmetric   (config)
 SPEC_FWHM_NM        = SPEC_FWHM_NM              # design FWHM per ring        (config)
 SPEC_N_RADII        = 100
-SPEC_R_HALF_SPAN_UM = 19    # [µm]  search half-width around analytical estimate
-SPEC_R_MIN_FLOOR_UM = 20    # [µm]  absolute lower bound (bend loss guard)
+SPEC_WINDOW_FRAC    = 0.30   # half-width of each ring's search window (fraction of R_est)
+SPEC_R_FAB_MIN_UM   = 1.5    # [µm]  hard fabrication floor on the radius
+SPEC_TE_FRAC_MIN    = 0.5    # min TE polarization fraction to count a mode as "TE"
 SPEC_DELTA_LAM_NG_NM = 5.0   # [nm]
+SPEC_CORE_MESH_NM     = 10.0    # [nm]  target dy = dz inside the core override box
+SPEC_CORE_MESH_PAD_NM = 400.0   # [nm]  how far the fine box extends past the core (tails)
 SPEC_USE_PML_FOR_LOSS = True    # PML boundaries for the loss solve (False = loss-blind)
 SPEC_Y_SPAN_LOSS_UM   = 16.0    # [µm]  widened lateral span so the PML is past the caustic
 SPEC_MESH_DY_NM       = 50.0    # [nm]  target y cell size over the widened span
@@ -178,6 +181,21 @@ def _sp_build_fde(mode, radius_m: float, wavelength_m: float,
     m.set("material", "<Object defined dielectric>")
     m.set("index",    N_SIN_FIXED)         # SiN = 1.99
 
+    # Local fine-mesh box on the core (+ tails). The small spectrometer-ring
+    # radii make the bent mode hard to resolve; without this the global mesh
+    # under-resolves the high-contrast core and returns spurious modes pinned
+    # near n_core. dy = dz = SPEC_CORE_MESH_NM.
+    _sp_core_mesh_m = SPEC_CORE_MESH_NM     * 1e-9
+    _sp_core_pad_m  = SPEC_CORE_MESH_PAD_NM * 1e-9
+    m.addmesh()
+    m.set("name",   "SP_core_mesh")
+    m.set("x",      0.0);  m.set("x span", 1.0e-6)
+    m.set("y",      0.0);  m.set("y span", _sp_wg_w_m + 2.0 * _sp_core_pad_m)
+    m.set("z",      0.0);  m.set("z span", _sp_core_t_um * 1e-6 + 2.0 * _sp_core_pad_m)
+    m.set("override x mesh", False)
+    m.set("override y mesh", True);  m.set("dy", _sp_core_mesh_m)
+    m.set("override z mesh", True);  m.set("dz", _sp_core_mesh_m)
+
 
 def _sp_collect_modes(mode, n_try: int):
     """
@@ -224,11 +242,20 @@ def _sp_solve_neff(mode, radius_m: float, wavelength_m: float,
             f"findmodes found no modes (R={radius_m*1e6:.3f} um, "
             f"lam={wavelength_m*1e9:.1f} nm, for_loss={for_loss})")
 
-    if for_loss and (neff_guess is not None):
-        _te_like = [mm for mm in found if mm[2] >= 0.5] or found
+    # Mode selection (same hardening as the sensor ring, step3):
+    #   - reject SPURIOUS modes: a guided mode must satisfy
+    #         N_SIO2_FIXED < Re(neff) < N_SIN_FIXED
+    #     (anything >= N_SIN_FIXED is a numerical artifact);
+    #   - keep TE-polarised modes (TE fraction >= SPEC_TE_FRAC_MIN);
+    #   - with a neff_guess, take the TE mode closest in Re(neff) -> same mode;
+    #   - else take the TE mode of HIGHEST Re(neff) = fundamental TE0.
+    _phys = [mm for mm in found if N_SIO2_FIXED < mm[1].real < N_SIN_FIXED]
+    _pool = _phys or found
+    _te_like = [mm for mm in _pool if mm[2] >= SPEC_TE_FRAC_MIN] or _pool
+    if neff_guess is not None:
         sel = min(_te_like, key=lambda mm: abs(mm[1].real - neff_guess))
     else:
-        sel = found[0]                       # fundamental = mode1 (original)
+        sel = max(_te_like, key=lambda mm: mm[1].real)
     ksel, nc, te_v = sel
 
     loss_dbm = np.nan
@@ -255,9 +282,13 @@ def _sp_neff_ng(mode, radius_m: float, lam0_m: float, dlam_m: float):
     lam_lo_m = lam0_m - dlam_m
     lam_hi_m = lam0_m + dlam_m
 
-    neff_lo, _, _,    _ = _sp_solve_neff(mode, radius_m, lam_lo_m, for_loss=False)
+    # lam0 locks the fundamental TE0 (highest-neff TE mode); lam_lo / lam_hi are
+    # anchored to that neff so all three solves track the SAME physical mode.
     neff_0,  _, te_v, _ = _sp_solve_neff(mode, radius_m, lam0_m,   for_loss=False)
-    neff_hi, _, _,    _ = _sp_solve_neff(mode, radius_m, lam_hi_m, for_loss=False)
+    neff_lo, _, _,    _ = _sp_solve_neff(mode, radius_m, lam_lo_m, for_loss=False,
+                                         neff_guess=neff_0)
+    neff_hi, _, _,    _ = _sp_solve_neff(mode, radius_m, lam_hi_m, for_loss=False,
+                                         neff_guess=neff_0)
 
     dneff_dlam    = (neff_hi - neff_lo) / (2.0 * dlam_m)
     ng            = neff_0 - lam0_m * dneff_dlam
@@ -455,7 +486,7 @@ def run(state=None):
     between steps (the notebook's old kernel globals + bridge).
     Returns the updated `state`."""
     state = {} if state is None else state
-    global N_SPEC_RINGS, SPEC_ALPHA_PROP_DBCM, SPEC_DELTA_LAM_NG_NM, SPEC_DELTA_LAM_NM, SPEC_FSR_NM, SPEC_FWHM_NM, SPEC_LAM0_NM, SPEC_LAM_NM, SPEC_LOSS_TRIAL_MODES, SPEC_MESH_DY_NM, SPEC_N_RADII, SPEC_N_UPPER, SPEC_PML_LAYERS, SPEC_R_HALF_SPAN_UM, SPEC_R_MIN_FLOOR_UM, SPEC_USE_PML_FOR_LOSS, SPEC_WG_WIDTH_NM, SPEC_Y_SPAN_LOSS_UM, _H1, _H2, _H3, _H4, _L_m, _N_n, _PM_MAX_ITER, _PM_TOL_M, _R_est_um, _R_m, _R_um, _SEP, _SEP2, _SP_DBCM_PER_INVM, _a_bend_match, _a_bend_per_m, _a_dbcm, _a_tot_dbcm, _ab_all, _ab_b, _ab_fin, _abend_n, _any_pos, _any_uncached, _av, _c, _cbar, _cmap, _cnorm, _colors, _comp_n, _delta, _dlam_ng_m, _dneff_dlam_str, _dng, _done_n, _el, _elapsed, _eta, _ext, _fig5_stem, _fig_stem, _fsr_all, _fsr_m, _fsr_was_cached, _glv, _gp, _grp_paths, _gv, _hdr, _i, _l, _lam0_n_m, _lam0_n_nm, _lam_b, _lam_m_arr, _lam_nm_arr, _lam_v, _loss_dbm, _loss_n, _lossdbm_n, _match_full_idx, _n, _n_done, _n_fsr_only, _neff_n, _neff_str, _neff_str_fit, _neff_v, _ngL_m, _ngL_m_i, _ngL_n, _ng_all, _ng_n, _ng_str, _ng_v, _nhi_n, _nhi_v, _nimag, _nimag_n, _nlo_n, _nlo_v, _nv, _ok, _pm, _poly_str, _r_all, _radii_um_n, _rate, _ratio, _remaining, _rfsr_v, _rg, _rmax, _rmin, _rpm_v, _runs, _rv, _sm, _sp_core_t_um, _sp_half_t_um, _sp_hf, _sp_mesh_y_loss, _sp_mode, _sp_sio2_z_ctr, _sp_sio2_z_span, _sp_wg_w_m, _sp_y_span_loss_um, _sp_y_span_um, _sp_z_above_um, _sp_z_below_um, _sp_z_ctr, _sp_z_span_um, _spec_r_max, _spec_r_min, _spec_radii_um, _spec_results, _spec_w_idx, _spec_w_nm, _spec_w_um, _src, _t0, _target_ngL_n_m, _target_ngL_n_um, _te_n, _te_str, _te_v, _tgt, _valid_n, _valid_str, _vn, _wl_str_m, ax00, ax01, ax10, ax11, axb0, axb1, axes, fig, fig5, spec_FSR_pm_nm, spec_L_pm_um, spec_Q_bend, spec_Q_i_total, spec_R_pm_um, spec_alpha_bend_dbcm, spec_alpha_total_dbcm, spec_lam_res_pm_nm, spec_m, spec_neff_imag, spec_neff_pm, spec_ng_pm
+    global N_SPEC_RINGS, SPEC_ALPHA_PROP_DBCM, SPEC_CORE_MESH_NM, SPEC_CORE_MESH_PAD_NM, SPEC_DELTA_LAM_NG_NM, SPEC_DELTA_LAM_NM, SPEC_FSR_NM, SPEC_FWHM_NM, SPEC_LAM0_NM, SPEC_LAM_NM, SPEC_LOSS_TRIAL_MODES, SPEC_MESH_DY_NM, SPEC_N_RADII, SPEC_N_UPPER, SPEC_PML_LAYERS, SPEC_R_FAB_MIN_UM, SPEC_TE_FRAC_MIN, SPEC_USE_PML_FOR_LOSS, SPEC_WG_WIDTH_NM, SPEC_WINDOW_FRAC, SPEC_Y_SPAN_LOSS_UM, _H1, _H2, _H3, _H4, _L_m, _N_n, _PM_MAX_ITER, _PM_TOL_M, _R_est_um, _R_m, _R_um, _SEP, _SEP2, _SP_DBCM_PER_INVM, _a_bend_match, _a_bend_per_m, _a_dbcm, _a_tot_dbcm, _ab_all, _ab_b, _ab_fin, _abend_n, _any_pos, _any_uncached, _av, _c, _cbar, _cmap, _cnorm, _colors, _comp_n, _delta, _dlam_ng_m, _dneff_dlam_str, _dng, _done_n, _el, _elapsed, _eta, _ext, _fig5_stem, _fig_stem, _fsr_all, _fsr_m, _fsr_was_cached, _glv, _gp, _grp_paths, _gv, _hdr, _i, _l, _lam0_n_m, _lam0_n_nm, _lam_b, _lam_m_arr, _lam_nm_arr, _lam_v, _loss_dbm, _loss_n, _lossdbm_n, _match_full_idx, _n, _n_done, _n_fsr_only, _neff_n, _neff_str, _neff_str_fit, _neff_v, _ngL_m, _ngL_m_i, _ngL_n, _ng_all, _ng_n, _ng_str, _ng_v, _nhi_n, _nhi_v, _nimag, _nimag_n, _nlo_n, _nlo_v, _nv, _ok, _pm, _poly_str, _r_all, _radii_um_n, _rate, _ratio, _remaining, _rfsr_v, _rg, _rmax, _rmin, _rpm_v, _runs, _rv, _sm, _sp_core_t_um, _sp_half_t_um, _sp_hf, _sp_mesh_y_loss, _sp_mode, _sp_sio2_z_ctr, _sp_sio2_z_span, _sp_wg_w_m, _sp_y_span_loss_um, _sp_y_span_um, _sp_z_above_um, _sp_z_below_um, _sp_z_ctr, _sp_z_span_um, _spec_r_max, _spec_r_min, _spec_radii_um, _spec_results, _spec_w_idx, _spec_w_nm, _spec_w_um, _src, _t0, _target_ngL_n_m, _target_ngL_n_um, _te_n, _te_str, _te_v, _tgt, _valid_n, _valid_str, _vn, _wl_str_m, ax00, ax01, ax10, ax11, axb0, axb1, axes, fig, fig5, spec_FSR_pm_nm, spec_L_pm_um, spec_Q_bend, spec_Q_i_total, spec_R_pm_um, spec_alpha_bend_dbcm, spec_alpha_total_dbcm, spec_lam_res_pm_nm, spec_m, spec_neff_imag, spec_neff_pm, spec_ng_pm
     globals()['lumapi'] = import_lumapi()
     globals().update(state)
 
@@ -486,7 +517,7 @@ def run(state=None):
     print(f"  Bend-loss solve: PML={SPEC_USE_PML_FOR_LOSS}, "
           f"y span {_sp_y_span_loss_um:.1f} µm, mesh_y {_sp_mesh_y_loss}, "
           f"{SPEC_PML_LAYERS} PML layers, near-n seed, {SPEC_LOSS_TRIAL_MODES} trial modes")
-    print(f"  HDF5 file      : {HDF5_PATH_SIO2}")
+    print(f"  HDF5 file      : {HDF5_PATH_SPECTROMETER}")
     print("=" * 70)
     print()
     _spec_w_um  = SPEC_WG_WIDTH_NM * 1e-3
@@ -516,8 +547,8 @@ def run(state=None):
     _spec_r_min    = []
     _spec_r_max    = []
     for _n in range(N_SPEC_RINGS):
-        _rmin = max(SPEC_R_MIN_FLOOR_UM, _R_est_um[_n] - SPEC_R_HALF_SPAN_UM)
-        _rmax = _R_est_um[_n] + SPEC_R_HALF_SPAN_UM
+        _rmin = max(SPEC_R_FAB_MIN_UM, _R_est_um[_n] * (1.0 - SPEC_WINDOW_FRAC))
+        _rmax = _R_est_um[_n] * (1.0 + SPEC_WINDOW_FRAC)
         _spec_radii_um.append(np.linspace(_rmin, _rmax, SPEC_N_RADII))
         _spec_r_min.append(_rmin)
         _spec_r_max.append(_rmax)
@@ -532,7 +563,7 @@ def run(state=None):
             _spec_r_min[_n], _spec_r_max[_n], SPEC_N_RADII,
         )
         _grp_paths.append(_gp)
-    _sp_hf = h5py.File(HDF5_PATH_SIO2, "a")
+    _sp_hf = h5py.File(HDF5_PATH_SPECTROMETER, "a")
     _any_uncached = False
     for _n in range(N_SPEC_RINGS):
         _gp = _grp_paths[_n]
@@ -780,7 +811,7 @@ def run(state=None):
         _sp_mode.close()
         log.info("MODE session closed.")
     _sp_hf.close()
-    log.info(f"HDF5 closed → {HDF5_PATH_SIO2}")
+    log.info(f"HDF5 closed → {HDF5_PATH_SPECTROMETER}")
     _SEP  = "─" * 134
     _SEP2 = "═" * 134
     print("\n\n")
@@ -1088,35 +1119,35 @@ def run(state=None):
     plt.close('all')
 
     state.update({k: globals().get(k) for k in [
-        'N_SPEC_RINGS', 'SPEC_ALPHA_PROP_DBCM', 'SPEC_DELTA_LAM_NG_NM', 'SPEC_DELTA_LAM_NM', 'SPEC_FSR_NM', 'SPEC_FWHM_NM',
-        'SPEC_LAM0_NM', 'SPEC_LAM_NM', 'SPEC_LOSS_TRIAL_MODES', 'SPEC_MESH_DY_NM', 'SPEC_N_RADII', 'SPEC_N_UPPER',
-        'SPEC_PML_LAYERS', 'SPEC_R_HALF_SPAN_UM', 'SPEC_R_MIN_FLOOR_UM', 'SPEC_USE_PML_FOR_LOSS', 'SPEC_WG_WIDTH_NM', 'SPEC_Y_SPAN_LOSS_UM',
-        '_H1', '_H2', '_H3', '_H4', '_L_m', '_N_n',
-        '_PM_MAX_ITER', '_PM_TOL_M', '_R_est_um', '_R_m', '_R_um', '_SEP',
-        '_SEP2', '_SP_DBCM_PER_INVM', '_a_bend_match', '_a_bend_per_m', '_a_dbcm', '_a_tot_dbcm',
-        '_ab_all', '_ab_b', '_ab_fin', '_abend_n', '_any_pos', '_any_uncached',
-        '_av', '_c', '_cbar', '_cmap', '_cnorm', '_colors',
-        '_comp_n', '_delta', '_dlam_ng_m', '_dneff_dlam_str', '_dng', '_done_n',
-        '_el', '_elapsed', '_eta', '_ext', '_fig5_stem', '_fig_stem',
-        '_fsr_all', '_fsr_m', '_fsr_was_cached', '_glv', '_gp', '_grp_paths',
-        '_gv', '_hdr', '_i', '_l', '_lam0_n_m', '_lam0_n_nm',
-        '_lam_b', '_lam_m_arr', '_lam_nm_arr', '_lam_v', '_loss_dbm', '_loss_n',
-        '_lossdbm_n', '_match_full_idx', '_n', '_n_done', '_n_fsr_only', '_neff_n',
-        '_neff_str', '_neff_str_fit', '_neff_v', '_ngL_m', '_ngL_m_i', '_ngL_n',
-        '_ng_all', '_ng_n', '_ng_str', '_ng_v', '_nhi_n', '_nhi_v',
-        '_nimag', '_nimag_n', '_nlo_n', '_nlo_v', '_nv', '_ok',
-        '_pm', '_poly_str', '_r_all', '_radii_um_n', '_rate', '_ratio',
-        '_remaining', '_rfsr_v', '_rg', '_rmax', '_rmin', '_rpm_v',
-        '_runs', '_rv', '_sm', '_sp_core_t_um', '_sp_half_t_um', '_sp_hf',
-        '_sp_mesh_y_loss', '_sp_mode', '_sp_sio2_z_ctr', '_sp_sio2_z_span', '_sp_wg_w_m', '_sp_y_span_loss_um',
-        '_sp_y_span_um', '_sp_z_above_um', '_sp_z_below_um', '_sp_z_ctr', '_sp_z_span_um', '_spec_r_max',
-        '_spec_r_min', '_spec_radii_um', '_spec_results', '_spec_w_idx', '_spec_w_nm', '_spec_w_um',
-        '_src', '_t0', '_target_ngL_n_m', '_target_ngL_n_um', '_te_n', '_te_str',
-        '_te_v', '_tgt', '_valid_n', '_valid_str', '_vn', '_wl_str_m',
-        'ax00', 'ax01', 'ax10', 'ax11', 'axb0', 'axb1',
-        'axes', 'fig', 'fig5', 'spec_FSR_pm_nm', 'spec_L_pm_um', 'spec_Q_bend',
-        'spec_Q_i_total', 'spec_R_pm_um', 'spec_alpha_bend_dbcm', 'spec_alpha_total_dbcm', 'spec_lam_res_pm_nm', 'spec_m',
-        'spec_neff_imag', 'spec_neff_pm', 'spec_ng_pm',
+        'N_SPEC_RINGS', 'SPEC_ALPHA_PROP_DBCM', 'SPEC_CORE_MESH_NM', 'SPEC_CORE_MESH_PAD_NM', 'SPEC_DELTA_LAM_NG_NM', 'SPEC_DELTA_LAM_NM',
+        'SPEC_FSR_NM', 'SPEC_FWHM_NM', 'SPEC_LAM0_NM', 'SPEC_LAM_NM', 'SPEC_LOSS_TRIAL_MODES', 'SPEC_MESH_DY_NM',
+        'SPEC_N_RADII', 'SPEC_N_UPPER', 'SPEC_PML_LAYERS', 'SPEC_R_FAB_MIN_UM', 'SPEC_TE_FRAC_MIN', 'SPEC_USE_PML_FOR_LOSS',
+        'SPEC_WG_WIDTH_NM', 'SPEC_WINDOW_FRAC', 'SPEC_Y_SPAN_LOSS_UM', '_H1', '_H2', '_H3',
+        '_H4', '_L_m', '_N_n', '_PM_MAX_ITER', '_PM_TOL_M', '_R_est_um',
+        '_R_m', '_R_um', '_SEP', '_SEP2', '_SP_DBCM_PER_INVM', '_a_bend_match',
+        '_a_bend_per_m', '_a_dbcm', '_a_tot_dbcm', '_ab_all', '_ab_b', '_ab_fin',
+        '_abend_n', '_any_pos', '_any_uncached', '_av', '_c', '_cbar',
+        '_cmap', '_cnorm', '_colors', '_comp_n', '_delta', '_dlam_ng_m',
+        '_dneff_dlam_str', '_dng', '_done_n', '_el', '_elapsed', '_eta',
+        '_ext', '_fig5_stem', '_fig_stem', '_fsr_all', '_fsr_m', '_fsr_was_cached',
+        '_glv', '_gp', '_grp_paths', '_gv', '_hdr', '_i',
+        '_l', '_lam0_n_m', '_lam0_n_nm', '_lam_b', '_lam_m_arr', '_lam_nm_arr',
+        '_lam_v', '_loss_dbm', '_loss_n', '_lossdbm_n', '_match_full_idx', '_n',
+        '_n_done', '_n_fsr_only', '_neff_n', '_neff_str', '_neff_str_fit', '_neff_v',
+        '_ngL_m', '_ngL_m_i', '_ngL_n', '_ng_all', '_ng_n', '_ng_str',
+        '_ng_v', '_nhi_n', '_nhi_v', '_nimag', '_nimag_n', '_nlo_n',
+        '_nlo_v', '_nv', '_ok', '_pm', '_poly_str', '_r_all',
+        '_radii_um_n', '_rate', '_ratio', '_remaining', '_rfsr_v', '_rg',
+        '_rmax', '_rmin', '_rpm_v', '_runs', '_rv', '_sm',
+        '_sp_core_t_um', '_sp_half_t_um', '_sp_hf', '_sp_mesh_y_loss', '_sp_mode', '_sp_sio2_z_ctr',
+        '_sp_sio2_z_span', '_sp_wg_w_m', '_sp_y_span_loss_um', '_sp_y_span_um', '_sp_z_above_um', '_sp_z_below_um',
+        '_sp_z_ctr', '_sp_z_span_um', '_spec_r_max', '_spec_r_min', '_spec_radii_um', '_spec_results',
+        '_spec_w_idx', '_spec_w_nm', '_spec_w_um', '_src', '_t0', '_target_ngL_n_m',
+        '_target_ngL_n_um', '_te_n', '_te_str', '_te_v', '_tgt', '_valid_n',
+        '_valid_str', '_vn', '_wl_str_m', 'ax00', 'ax01', 'ax10',
+        'ax11', 'axb0', 'axb1', 'axes', 'fig', 'fig5',
+        'spec_FSR_pm_nm', 'spec_L_pm_um', 'spec_Q_bend', 'spec_Q_i_total', 'spec_R_pm_um', 'spec_alpha_bend_dbcm',
+        'spec_alpha_total_dbcm', 'spec_lam_res_pm_nm', 'spec_m', 'spec_neff_imag', 'spec_neff_pm', 'spec_ng_pm',
     ] if k in globals()})
     return state
 

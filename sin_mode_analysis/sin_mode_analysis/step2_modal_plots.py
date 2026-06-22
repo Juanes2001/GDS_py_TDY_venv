@@ -27,7 +27,6 @@ from . import plotting as _plot
 # ── Data-contract inputs (injected by main.py via `state`) ──────────
 neff_real = None
 neff_real_sio2 = None
-select_single_mode_width_nm = None
 sweep_widths_um = None
 sweep_wl_nm = None
 te_frac = None
